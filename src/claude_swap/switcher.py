@@ -33,6 +33,7 @@ from claude_swap.json_output import (
     USAGE_TOKEN_EXPIRED,
     account_ref,
     account_row,
+    last_good_usage_fields,
     usage_fields,
     usage_freshness_fields,
 )
@@ -3214,6 +3215,7 @@ class ClaudeAccountSwitcher:
                     entry.decision_value(),
                     usage_fetched_at=entry.fetched_at,
                     usage_age_s=entry.age_s,
+                    last_good_usage=entry.last_good,
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                 )
@@ -3395,6 +3397,12 @@ class ClaudeAccountSwitcher:
             active["alias"] = alias
         if usage is not None:
             active.update(usage_freshness_fields(entry.fetched_at, entry.age_s))
+        else:
+            active.update(
+                last_good_usage_fields(
+                    entry.last_good, entry.fetched_at, entry.age_s
+                )
+            )
         return {
             "schemaVersion": SCHEMA_VERSION,
             "active": active,
