@@ -43,12 +43,18 @@ class TestParseOsc11:
     def test_framed_rgb_parses(self):
         assert appearance._parse_osc11(b"\x1b]11;rgb:ffff/ffff/ffff\x07") == (1.0, 1.0, 1.0)
 
+    def test_unterminated_rgb_is_rejected(self):
+        assert appearance._parse_osc11(b"\x1b]11;rgb:ffff/ffff/ffff") is None
+
     def test_unframed_hex_is_rejected(self):
         assert appearance._parse_osc11(b"#ff8000") is None
 
     def test_framed_hex_parses(self):
         r, _, b = appearance._parse_osc11(b"\x1b]11;#ff8000\x07")
         assert r == pytest.approx(1.0) and b == pytest.approx(0.0)
+
+    def test_unterminated_hex_is_rejected(self):
+        assert appearance._parse_osc11(b"\x1b]11;#ff8000") is None
 
 
 class TestClassify:
@@ -66,6 +72,123 @@ class TestClassify:
 
     def test_unparseable_returns_none(self):
         assert appearance._classify(b"nope") is None
+
+
+class TestQueryTerminalBackground:
+    @staticmethod
+    def _fake_tty(monkeypatch, chunks, *, clock=None):
+        termios = pytest.importorskip("termios")
+        import tty
+
+        fd = 42
+        pending = list(chunks)
+        reads = []
+        writes = []
+        select_timeouts = []
+
+        class FakeStdin:
+            @staticmethod
+            def isatty():
+                return True
+
+            @staticmethod
+            def fileno():
+                return fd
+
+        class FakeStdout:
+            @staticmethod
+            def isatty():
+                return True
+
+            @staticmethod
+            def write(value):
+                writes.append(value)
+                return len(value)
+
+            @staticmethod
+            def flush():
+                return None
+
+        def fake_select(readers, _writers, _errors, timeout):
+            assert readers == [fd]
+            select_timeouts.append(timeout)
+            return ([fd], [], []) if pending else ([], [], [])
+
+        def fake_read(read_fd, size):
+            assert read_fd == fd
+            assert size == 32
+            chunk = pending.pop(0)
+            reads.append(chunk)
+            return chunk
+
+        monkeypatch.setenv("TERM", "xterm-256color")
+        monkeypatch.delenv("TMUX", raising=False)
+        monkeypatch.delenv("STY", raising=False)
+        monkeypatch.setattr(sys, "stdin", FakeStdin())
+        monkeypatch.setattr(sys, "stdout", FakeStdout())
+        monkeypatch.setattr(termios, "tcgetattr", lambda read_fd: ["old"])
+        monkeypatch.setattr(termios, "tcsetattr", lambda *args: None)
+        monkeypatch.setattr(tty, "setcbreak", lambda *args: None)
+        monkeypatch.setattr(appearance.select, "select", fake_select)
+        monkeypatch.setattr(appearance.os, "read", fake_read)
+        if clock is not None:
+            monkeypatch.setattr(appearance.time, "monotonic", clock)
+
+        return reads, writes, select_timeouts
+
+    def test_waits_for_da1_after_complete_osc_reply(self, monkeypatch):
+        osc = b"\x1b]11;rgb:1e1d/1e1d/1e1d\x07"
+        da1 = b"\x1b[?1;2c"
+        reads, writes, _ = self._fake_tty(monkeypatch, [osc, da1])
+
+        assert appearance._query_terminal_background() == osc + da1
+        assert reads == [osc, da1]
+        assert writes == [
+            (appearance._QUERY + appearance._DA1_QUERY).decode("latin-1")
+        ]
+
+    def test_accepts_reply_delayed_beyond_old_150ms_window(self, monkeypatch):
+        reply = b"\x1b]11;rgb:ffff/ffff/ffff\x07\x1b[?1;2c"
+        times = iter((0.0, 0.2, 0.2))
+        _, _, select_timeouts = self._fake_tty(
+            monkeypatch, [reply], clock=lambda: next(times)
+        )
+
+        assert appearance._query_terminal_background() == reply
+        assert select_timeouts == [pytest.approx(0.8)]
+
+    def test_da1_first_means_osc11_is_unsupported(self, monkeypatch):
+        da1 = b"\x1b[?62;1;2;6c"
+        reads, _, _ = self._fake_tty(monkeypatch, [da1])
+
+        reply = appearance._query_terminal_background()
+
+        assert reads == [da1]
+        assert appearance._classify(reply) is None
+
+    def test_accepts_da1_reply_without_parameters(self, monkeypatch):
+        da1 = b"\x1b[?c"
+        reads, _, _ = self._fake_tty(monkeypatch, [da1])
+
+        assert appearance._query_terminal_background() == da1
+        assert reads == [da1]
+
+    def test_does_not_mistake_echoed_da1_query_for_reply(self, monkeypatch):
+        echoed_query = appearance._DA1_QUERY
+        osc = b"\x1b]11;rgb:0000/0000/0000\x07"
+        da1 = b"\x1b[?1;2c"
+        reads, _, _ = self._fake_tty(monkeypatch, [echoed_query, osc, da1])
+
+        assert appearance._query_terminal_background() == echoed_query + osc + da1
+        assert reads == [echoed_query, osc, da1]
+
+    def test_accepts_fragmented_da1_reply(self, monkeypatch):
+        osc = b"\x1b]11;rgb:0000/0000/0000\x07"
+        fragments = [osc, b"\x1b[?", b"62;1;2;6c"]
+        reads, _, _ = self._fake_tty(monkeypatch, fragments)
+
+        assert appearance._query_terminal_background() == b"".join(fragments)
+        assert reads == fragments
 
 
 class TestResolveTheme:
@@ -196,6 +319,20 @@ def test_query_short_circuits_under_tmux(monkeypatch):
 
     def _boom():
         raise AssertionError("must not probe the tty under tmux")
+
+    monkeypatch.setattr(sys.stdin, "fileno", _boom, raising=False)
+    assert appearance._query_terminal_background() is None
+
+
+@pytest.mark.parametrize("term", ["dumb", "linux"])
+def test_query_short_circuits_on_known_unsupported_terminals(monkeypatch, term):
+    """Known unsupported terminals must not receive escape-sequence probes."""
+    monkeypatch.setenv("TERM", term)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+
+    def _boom():
+        raise AssertionError("must not probe a known unsupported terminal")
 
     monkeypatch.setattr(sys.stdin, "fileno", _boom, raising=False)
     assert appearance._query_terminal_background() is None
