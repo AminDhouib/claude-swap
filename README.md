@@ -72,10 +72,7 @@ Not sure which one? `cswap list` is the dashboard — every account's 5-hour and
 
 ```bash
 cswap list
-cswap list --token-status      # show labeled token diagnostics per credential source
 ```
-
-`--token-status` only adds diagnostics: active rows label the active profile, inactive rows distinguish the session profile from the stored backup, and known-drifted session logins are ignored. It never synchronizes credential sources or changes which credential the normal usage path selects.
 
 Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy best` (most quota left) or `--strategy next-available` (skip rate-limited accounts).
 
