@@ -345,8 +345,13 @@ def _rate_limited_trust_ok(
 
 
 def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -> float:
+    # Clamp the exponent before multiplying: a permanently failing account
+    # increments the counter forever, and 2**n stops converting to float at
+    # n >= 1024 (OverflowError) — long before min() could cap the result.
+    # 32 doublings already exceed BACKOFF_CAP_S by orders of magnitude.
     computed = min(
-        BACKOFF_BASE_S * (2 ** max(0, consecutive_failures - 1)), BACKOFF_CAP_S
+        BACKOFF_BASE_S * (2 ** min(max(0, consecutive_failures - 1), 32)),
+        BACKOFF_CAP_S,
     )
     if retry_after_s is None:
         return computed

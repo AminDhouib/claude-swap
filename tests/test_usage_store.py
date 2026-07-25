@@ -317,6 +317,37 @@ class TestBackoff:
     def test_backoff_cap(self):
         assert usage_store._failure_backoff_s(50, None) == BACKOFF_CAP_S
 
+    def test_huge_failure_count_does_not_overflow(self):
+        # A permanently failing account increments consecutiveFailures forever;
+        # past 1024 failures 2**(n-1) no longer converts to float and the old
+        # code raised OverflowError before min() could cap it — killing every
+        # subsequent tick (the crash also stopped the state write, so the
+        # counter never moved and the loop errored forever).
+        assert usage_store._failure_backoff_s(1025, None) == BACKOFF_CAP_S
+        assert usage_store._failure_backoff_s(10_000, 90.0) == BACKOFF_CAP_S
+
+    def test_record_failure_on_saturated_counter_does_not_raise(self, store, clock):
+        store.path.parent.mkdir(parents=True)
+        store.path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 2,
+                    "accounts": {
+                        "1": {
+                            "email": "a@x.com",
+                            "consecutiveFailures": 1024,
+                            "lastError": "refresh-failed",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        store.record({"1": FetchRecord(error="refresh-failed")}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.consecutive_failures == 1025
+        assert entry.backoff_until == pytest.approx(clock.now + BACKOFF_CAP_S)
+
     def test_retry_after_is_the_floor(self, store, clock):
         store.record(
             {"1": FetchRecord(error="http-429", retry_after_s=90.0)}, IDENT
