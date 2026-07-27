@@ -562,6 +562,14 @@ class TestClaims:
             "1"
         }
 
+    def test_unfenced_record_accepts_after_a_claim_expires(self, store, clock):
+        store.reserve(["1"], IDENT, respect_plans=True)
+        clock.advance(CLAIM_TTL_S + 1)
+        assert store.record({"1": FetchRecord(usage=USAGE)}, IDENT) == {"1"}
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good == USAGE
+        assert not entry.claimed(clock.now)
+
     def test_credential_refresh_revokes_an_old_fetch_claim(self, store, clock):
         claims = store.reserve(["1"], IDENT, respect_plans=True)
         store.clear_dead_token(["1"], IDENT)

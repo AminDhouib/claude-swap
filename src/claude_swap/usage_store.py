@@ -20,8 +20,10 @@ Locking protocol (never holds the lock across network I/O):
 (b) fetch with no lock held;
 (c) lock → re-read, merge outcomes, clear the claim, write → unlock.
 The bounded lease lets concurrent collectors skip accounts another process is
-still fetching; a completed fetch releases it immediately and a crashed claimer
-ages out.
+still fetching; recording the outcome releases it and a crashed claimer ages
+out. The collector records per *batch*, so a fast account's lease is held
+until its batch's slowest fetch lands — the lease TTL is sized for the whole
+batch, not one request.
 """
 
 from __future__ import annotations
@@ -613,8 +615,9 @@ class UsageStore:
         exclusive writers: success resets the failure fields, failure never
         touches ``lastGood``/``fetchedAt``. A supplied success plan commits
         in the same transaction as its measurement. Sentinel records clear
-        only the claim and are otherwise never persisted. Returns the accepted
-        slots.
+        only the claim and are otherwise never persisted. Unfenced callers
+        (no ``claims``) defer to a live lease but never to an expired one.
+        Returns the accepted slots.
         """
         if not outcomes:
             return set()
@@ -673,7 +676,13 @@ class UsageStore:
                         or row.get("claimId") != expected
                     ):
                         continue
-                elif isinstance(row, dict) and row.get("claimId") is not None:
+                elif (
+                    isinstance(row, dict)
+                    and row.get("claimId") is not None
+                    # Only a live lease defers an unfenced writer; a crashed
+                    # claimer's leftover ticket must age out, not block forever.
+                    and now < (_num_or_none(row.get("claimUntil")) or 0.0)
+                ):
                     continue
                 elif not self._matches(row, identity):
                     rows[num] = row = self._fresh_row(identity)
