@@ -62,6 +62,26 @@ STALE_OK_S = 300.0  # trusted for switch decisions; older → headroom unknown
 CLAIM_TTL_S = 90.0  # in-flight claim window: skip just-claimed accounts
 LEGACY_CLAIM_TTL_S = 10.0  # additive-schema overlap with older collectors
 
+
+def _live_claim(
+    claim_until: float | None, last_attempt_at: float | None, now: float
+) -> bool:
+    """Whether a collector's fetch lease on a row is still live.
+
+    ``claim_until`` (the fenced lease) wins when present; rows written by an
+    older process fall back to ``lastAttemptAt`` + ``LEGACY_CLAIM_TTL_S``.
+    The single source of truth for claim liveness — ``UsageEntry.claimed``,
+    ``entries()``, and ``_row_eligible`` must all agree, or concurrent
+    collectors double-fetch. (``record()`` deliberately checks only the
+    fenced form; see its comment.)
+    """
+    if claim_until is not None:
+        return now < claim_until
+    return (
+        last_attempt_at is not None
+        and (now - last_attempt_at) < LEGACY_CLAIM_TTL_S
+    )
+
 # Deliberate staleness (failure backoff, scheduler-chosen cadence) extends
 # decision trust past STALE_OK_S, but never past this ceiling: a forever-failing
 # account must eventually read as unknown so the unknown-path machinery
@@ -241,13 +261,7 @@ class UsageEntry:
 
     def claimed(self, now: float) -> bool:
         """Whether another collector's bounded fetch lease is still live."""
-        if self.claim_until is not None:
-            return now < self.claim_until
-        # Additive-schema compatibility for rows claimed by an older process.
-        return (
-            self.last_attempt_at is not None
-            and (now - self.last_attempt_at) < LEGACY_CLAIM_TTL_S
-        )
+        return _live_claim(self.claim_until, self.last_attempt_at, now)
 
     def token_dead(self, threshold: int = AUTH_DEAD_STRIKES) -> bool:
         """Whether the stored credential's refresh-token lineage is provably dead.
@@ -516,14 +530,7 @@ class UsageStore:
                 )
             else:
                 within_ceiling = age_s is not None and age_s <= TRUST_MAX_AGE_S
-            live_claim = (
-                now < claim_until
-                if claim_until is not None
-                else (
-                    last_attempt_at is not None
-                    and (now - last_attempt_at) < LEGACY_CLAIM_TTL_S
-                )
-            )
+            live_claim = _live_claim(claim_until, last_attempt_at, now)
             trust_extended = (
                 within_ceiling
                 and (
@@ -791,17 +798,12 @@ def _row_eligible(
     backoff_until = _num_or_none(row.get("backoffUntil"))
     if backoff_until is not None and now < backoff_until:
         return False
-    claim_until = _num_or_none(row.get("claimUntil"))
-    if claim_until is not None:
-        if now < claim_until:
-            return False
-    else:
-        last_attempt = _num_or_none(row.get("lastAttemptAt"))
-        if (
-            last_attempt is not None
-            and (now - last_attempt) < LEGACY_CLAIM_TTL_S
-        ):
-            return False
+    if _live_claim(
+        _num_or_none(row.get("claimUntil")),
+        _num_or_none(row.get("lastAttemptAt")),
+        now,
+    ):
+        return False
     fetched_at = _num_or_none(row.get("fetchedAt"))
     stale = fetched_at is None or (now - fetched_at) > SERVE_TTL_S
     next_poll_at = _num_or_none(row.get("nextPollAt"))

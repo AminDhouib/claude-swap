@@ -19,6 +19,7 @@ from textual.worker import WorkerState
 
 from claude_swap import printer
 from claude_swap.models import AccountsSnapshot
+from claude_swap.snapshot_source import account_identity
 from claude_swap.settings import load_settings, load_ui_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
@@ -172,8 +173,7 @@ class CswapApp(App):
                 replace(acc, usage=other.usage)
                 if (
                     (other := incoming.get(acc.number)) is not None
-                    and (acc.email, acc.org_uuid, acc.kind)
-                    == (other.email, other.org_uuid, other.kind)
+                    and account_identity(acc) == account_identity(other)
                 )
                 else acc
                 for acc in current.accounts

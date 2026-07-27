@@ -292,8 +292,10 @@ class ClaudeAccountSwitcher:
 
         # Accounts already warned about an unattributable active credential —
         # the condition persists across collect passes and would otherwise
-        # log every tick. Cleared when the condition clears.
-        self._provenance_warned: set[str] = set()
+        # log every tick. Cleared when the condition clears. Keyed by
+        # (slot, email) so a slot reused for a different account in a
+        # long-lived process warns afresh.
+        self._provenance_warned: set[tuple[str, str]] = set()
 
         # Run any pending one-time data migrations (e.g. relocating Windows
         # backup credentials out of Credential Manager into files). Imported
@@ -1756,6 +1758,19 @@ class ClaudeAccountSwitcher:
         organization_uuid = oauth.get("organizationUuid", "") or ""
         return (email, organization_uuid)
 
+    def _live_identity_matches(self, email: str, org_uuid: str) -> bool:
+        """Whether the live config identity is (email, org_uuid) right now.
+
+        The under-lock TOCTOU identity re-check shared by the locked refresh
+        and the rotated-backup resync: a switch or /login landing between a
+        caller's pre-lock read and its lock acquisition changes this identity,
+        and a mismatch means the live store is no longer the caller's account
+        — nothing there is its to adopt, consume, or overwrite. Compares the
+        organization too: two managed slots may share an email across orgs.
+        """
+        identity = self._get_current_account()
+        return identity is not None and identity == (email, org_uuid or "")
+
     @staticmethod
     def _find_account_slot(
         data: dict, email: str, organization_uuid: str
@@ -2638,8 +2653,8 @@ class ClaudeAccountSwitcher:
         if not attributable and not backup_usable:
             # Nothing safe to consume and nothing to restore from. Warn once
             # per condition, not per collect pass.
-            if account_num not in self._provenance_warned:
-                self._provenance_warned.add(account_num)
+            if (account_num, email) not in self._provenance_warned:
+                self._provenance_warned.add((account_num, email))
                 self._logger.warning(
                     "Active credential does not match Account-%s's stored "
                     "backup and the backup is unusable; cannot refresh "
@@ -2647,7 +2662,7 @@ class ClaudeAccountSwitcher:
                     account_num,
                 )
             return _defer(force_refresh)
-        self._provenance_warned.discard(account_num)
+        self._provenance_warned.discard((account_num, email))
 
         # Claude Code's own sequence: locks → re-read → decide → POST →
         # persist unconditionally → release. A concurrently refreshing CC is
@@ -2696,8 +2711,7 @@ class ClaudeAccountSwitcher:
                 # - lineage (refresh-token fingerprint): decides whether the
                 #   live bytes may be CONSUMED or must be replaced from the
                 #   backup.
-                identity = self._get_current_account()
-                if identity is None or identity != (email, org_uuid or ""):
+                if not self._live_identity_matches(email, org_uuid):
                     return _defer(force_refresh)
                 if (
                     live_oauth
@@ -2805,8 +2819,14 @@ class ClaudeAccountSwitcher:
                         restore_source = backup
                         working = backup
                     else:
+                        # The POST runs while holding the account FileLock
+                        # (contended by `cswap switch` with a 10s acquire
+                        # budget) and CC's credential locks. Bound it well
+                        # inside that budget so a slow network can't make a
+                        # concurrent switch's acquire expire — the switch
+                        # then waits out the tail instead of erroring.
                         result = oauth.try_refresh_oauth_credentials(
-                            refresh_input
+                            refresh_input, timeout_s=6.0
                         )
                         if result.error in (
                             "invalid_grant", "no_refresh_token"
@@ -2939,8 +2959,7 @@ class ClaudeAccountSwitcher:
             ):
                 # Identity re-check under the lock: a switch/login landing in
                 # the gap means the live store is no longer this account's.
-                identity = self._get_current_account()
-                if identity is None or identity != (email, org_uuid or ""):
+                if not self._live_identity_matches(email, org_uuid):
                     return
                 # Re-read live under the lock and require it to still carry
                 # the served credential's lineage with a full pair — resync

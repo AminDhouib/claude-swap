@@ -1556,7 +1556,7 @@ class TestActiveAccountRefresh:
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
         return switcher
 
-    def _refresh_ok(self, credentials):
+    def _refresh_ok(self, credentials, **kw):
         return oauth.RefreshOutcome(self._REFRESHED, None)
 
     def test_expired_refreshes_under_locks_and_persists_both_stores(
@@ -1570,7 +1570,7 @@ class TestActiveAccountRefresh:
         usage_result = {"five_hour": {"pct": 10}}
         locks_held_during_post = {}
 
-        def mock_refresh(credentials):
+        def mock_refresh(credentials, **kw):
             from claude_swap.claude_locks import config_lock_dir
             locks_held_during_post["primary"] = oauth_refresh_lock_dir().is_dir()
             locks_held_during_post["legacy"] = credentials_lock_dir().is_dir()
@@ -1794,7 +1794,7 @@ class TestActiveAccountRefresh:
         })
         consumed = []
 
-        def mock_refresh(credentials):
+        def mock_refresh(credentials, **kw):
             consumed.append(credentials)
             return oauth.RefreshOutcome(self._REFRESHED, None)
 
@@ -2279,7 +2279,8 @@ class TestActiveAccountRefresh:
             )
 
         assert result.sentinel is None
-        mock_refresh.assert_called_once_with(live_b)   # B, never A
+        mock_refresh.assert_called_once()
+        assert mock_refresh.call_args[0][0] == live_b   # B, never A
         write_backup.assert_called_once_with(
             "1", "test@example.com", self._REFRESHED
         )
@@ -2322,7 +2323,8 @@ class TestActiveAccountRefresh:
             )
 
         assert result.sentinel is None
-        mock_refresh.assert_called_once_with(live_s)
+        mock_refresh.assert_called_once()
+        assert mock_refresh.call_args[0][0] == live_s
 
     def test_stranded_backup_newer_still_restores_not_consumes_live(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -6766,7 +6768,7 @@ class TestActiveRefreshProvenance:
         }})
         consumed = []
 
-        def mock_refresh(credentials):
+        def mock_refresh(credentials, **kw):
             consumed.append(credentials)
             return oauth.RefreshOutcome(refreshed, None)
 
