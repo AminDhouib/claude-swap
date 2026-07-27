@@ -78,6 +78,11 @@ RATE_LIMIT_TRUST_MAX_AGE_S = 7200.0
 # Failure backoff when the server sent no Retry-After: 30s · 2^(n-1), capped.
 BACKOFF_BASE_S = 30.0
 BACKOFF_CAP_S = 600.0
+# Exponent clamp: a permanently failing account increments its failure count
+# forever, and 2**n stops converting to float at n >= 1024 (OverflowError).
+# The curve already saturates at BACKOFF_CAP_S by shift 5, so any cap above
+# that is behaviour-preserving.
+BACKOFF_MAX_SHIFT = 32
 
 # The usage endpoint enforces a per-access-token request budget on
 # non-first-party User-Agents (proven 2026-07-11: an idle token, polling
@@ -345,12 +350,8 @@ def _rate_limited_trust_ok(
 
 
 def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -> float:
-    # Clamp the exponent before multiplying: a permanently failing account
-    # increments the counter forever, and 2**n stops converting to float at
-    # n >= 1024 (OverflowError) — long before min() could cap the result.
-    # 32 doublings already exceed BACKOFF_CAP_S by orders of magnitude.
     computed = min(
-        BACKOFF_BASE_S * (2 ** min(max(0, consecutive_failures - 1), 32)),
+        BACKOFF_BASE_S * (2 ** min(max(0, consecutive_failures - 1), BACKOFF_MAX_SHIFT)),
         BACKOFF_CAP_S,
     )
     if retry_after_s is None:
