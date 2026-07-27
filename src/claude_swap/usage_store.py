@@ -39,7 +39,10 @@ from claude_swap.locking import FileLock
 from claude_swap import oauth
 from claude_swap.poll_policy import (
     EDGE_BACKOFF_S,
+    EXHAUSTED_INTERVAL_S,
+    JITTER_FRAC,
     RECENT_429_WINDOW_S,
+    RESET_SLACK_S,
     SERVE_TTL_S,
     parse_reset_ts,
 )
@@ -273,6 +276,34 @@ class UsageEntry:
         return None
 
 
+def _plan_oversleeps_interval(
+    next_poll_at: float | None,
+    poll_interval_s: float | None,
+    now: float,
+) -> bool:
+    """Whether a deadline cannot have come from the bounded planner."""
+    if next_poll_at is None:
+        return False
+    interval = max(poll_interval_s or EXHAUSTED_INTERVAL_S, EXHAUSTED_INTERVAL_S)
+    latest_normal_poll = now + interval * (1.0 + JITTER_FRAC) + RESET_SLACK_S
+    return next_poll_at > latest_normal_poll
+
+
+def plan_oversleeps_interval(entry: UsageEntry, now: float) -> bool:
+    """Whether a row carries an obsolete reset-parked plan.
+
+    Reset-parking releases stored a distant reset deadline while retaining the
+    much shorter learned interval. Detect that impossible shape structurally,
+    independent of the current model selection, so changing scoped models
+    cannot leave an otherwise usable account parked until the old reset.
+    """
+    return _plan_oversleeps_interval(
+        entry.next_poll_at,
+        entry.poll_interval_s,
+        now,
+    )
+
+
 def due_candidate(
     candidates: list[str], entries: dict[str, UsageEntry], now: float
 ) -> str | None:
@@ -301,7 +332,11 @@ def due_candidate(
             continue  # dead refresh-token: quarantined, needs a re-login
         if entry.in_backoff(now):
             continue
-        if entry.next_poll_at is not None and now < entry.next_poll_at:
+        if (
+            entry.next_poll_at is not None
+            and now < entry.next_poll_at
+            and not plan_oversleeps_interval(entry, now)
+        ):
             continue
         if entry.fetched_at is None:
             due.append((0, 0.0, num))
@@ -558,6 +593,7 @@ class UsageStore:
         identities: dict[str, Identity],
         *,
         respect_plans: bool,
+        repair_overslept: bool = False,
     ) -> dict[str, str]:
         """Atomically win the right to fetch: re-check eligibility and stamp
         a bounded lease in one locked pass, returning slot → fencing id.
@@ -570,11 +606,16 @@ class UsageStore:
 
         - ``respect_plans=True`` (on-demand callers: list/status/switch,
           dashboards): the entry must be stale (older than ``SERVE_TTL_S``)
-          *and* poll-due (past ``nextPollAt``, or no plan yet).
+          *and* poll-due (past ``nextPollAt``, or no plan yet). When
+          ``repair_overslept`` is set, a structurally obsolete reset-parked
+          plan is also due; that predicate is re-checked under this lock.
         - ``respect_plans=False`` (the auto engine's deliberate schedule):
           poll-due *or* stale — a due entry may be re-fetched inside the
           serve TTL (that is how the bounded urgent cadence beats the TTL),
-          and an escalation refresh may fetch a not-yet-due candidate.
+          and an escalation refresh may fetch a not-yet-due candidate. With
+          ``repair_overslept``, this becomes the non-escalating scheduler mode:
+          due plans and stale impossible plans win, but valid future plans do
+          not.
         """
         nums = list(nums)
         if not nums:
@@ -590,7 +631,9 @@ class UsageStore:
                     rows[num] = row = self._fresh_row(identity)
                 else:
                     assert isinstance(row, dict)
-                    if not _row_eligible(row, now, respect_plans):
+                    if not _row_eligible(
+                        row, now, respect_plans, repair_overslept
+                    ):
                         continue
                 claim_id = uuid.uuid4().hex
                 row["lastAttemptAt"] = now
@@ -737,7 +780,9 @@ def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
-def _row_eligible(row: dict, now: float, respect_plans: bool) -> bool:
+def _row_eligible(
+    row: dict, now: float, respect_plans: bool, repair_overslept: bool = False
+) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
     (see :meth:`UsageStore.reserve` for the two caller modes)."""
     if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
@@ -760,8 +805,15 @@ def _row_eligible(row: dict, now: float, respect_plans: bool) -> bool:
     stale = fetched_at is None or (now - fetched_at) > SERVE_TTL_S
     next_poll_at = _num_or_none(row.get("nextPollAt"))
     poll_due = next_poll_at is not None and now >= next_poll_at
+    overslept = repair_overslept and _plan_oversleeps_interval(
+        next_poll_at,
+        _num_or_none(row.get("pollIntervalS")),
+        now,
+    )
     if respect_plans:
-        return stale and (poll_due or next_poll_at is None)
+        return stale and (poll_due or next_poll_at is None or overslept)
+    if repair_overslept:
+        return poll_due or (stale and (next_poll_at is None or overslept))
     return poll_due or stale
 
 

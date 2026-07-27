@@ -1334,16 +1334,19 @@ class ClaudeAccountSwitcher:
         return self._usage_by_account()
 
     def usage_entries_by_account(
-        self, fetch: set[str] | None = None
+        self, fetch: set[str] | None = None, *, scheduled: bool = False
     ) -> dict[str, UsageEntry]:
         """Store-backed usage entries (ages, errors, poll state) per account.
 
         ``fetch`` restricts which accounts *may* be fetched this pass (the
         auto engine's scheduler); ``None`` means every stale account is
-        eligible (on-demand callers).
+        eligible (on-demand callers). ``scheduled=True`` preserves valid
+        future plans while still allowing due plans to beat the serve TTL.
         """
         accounts_info = self._build_accounts_info()
-        return self._collect_usage_entries(accounts_info, fetch=fetch)
+        return self._collect_usage_entries(
+            accounts_info, fetch=fetch, scheduled=scheduled
+        )
 
     def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
         """One-pass structured snapshot of every managed account, for the TUI.
@@ -2815,6 +2818,8 @@ class ClaudeAccountSwitcher:
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
         fetch: set[str] | None = None,
+        *,
+        scheduled: bool = False,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
 
@@ -2822,7 +2827,8 @@ class ClaudeAccountSwitcher:
         strategies, dashboards) makes every account a candidate but respects
         the persisted poll plans; the auto engine passes an explicit set whose
         members may beat the serve TTL when their plan says so (urgent
-        cadence) or when escalation needs them fresh. Final eligibility —
+        cadence) or, unless ``scheduled`` is set, when escalation needs them
+        fresh. Final eligibility —
         freshness, backoff, claims, plans — is decided atomically by
         ``UsageStore.reserve``, so concurrent collectors can never
         double-fetch a slot. After each successful fetch the adapted cadence
@@ -2858,9 +2864,25 @@ class ClaudeAccountSwitcher:
             for num in info_by_num
             if num not in sentinels and (fetch is None or num in fetch)
         ]
-        claims = store.reserve(
-            requested, identities, respect_plans=fetch is None
-        )
+        if fetch is None:
+            # Repair reset-parked plans written by releases that stopped
+            # polling exhausted accounts until their advertised reset. The
+            # store recognizes that impossible deadline shape under the same
+            # lock that installs the claim, so a concurrent valid replan is
+            # never bypassed.
+            claims = store.reserve(
+                requested,
+                identities,
+                respect_plans=True,
+                repair_overslept=True,
+            )
+        else:
+            claims = store.reserve(
+                requested,
+                identities,
+                respect_plans=False,
+                repair_overslept=scheduled,
+            )
 
         if claims:
             pre = entries
