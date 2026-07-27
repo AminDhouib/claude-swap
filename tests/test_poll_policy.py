@@ -253,6 +253,12 @@ class TestResetCapping:
         assert interval == poll_policy.EXHAUSTED_INTERVAL_S
         assert next_poll == pytest.approx(reset_ts + poll_policy.RESET_SLACK_S)
 
+    @pytest.mark.parametrize("reset_ts", [NOW - 90.0, NOW])
+    def test_at_limit_ignores_non_future_reset(self, reset_ts):
+        next_poll, interval = _plan(new_usage=_usage(100, self._iso(reset_ts)))
+        assert interval == poll_policy.EXHAUSTED_INTERVAL_S
+        assert next_poll == pytest.approx(NOW + interval)
+
     def test_active_at_limit_uses_same_bounded_recovery_probe(self):
         reset_ts = NOW + 7_200.0
         next_poll, interval = _plan(

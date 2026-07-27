@@ -65,9 +65,10 @@ CANDIDATE_MAX_INTERVAL_S = 600.0
 # Exhaustion is stable enough to poll slowly, but not to stop polling until a
 # reported reset. Quota grants and provider-side corrections can make an
 # account usable before that timestamp, and decision-grade status must not age
-# into "unavailable" while the scheduler is deliberately waiting. Six-minute
-# polling stays below the measured per-token budget and detects recovery
-# promptly; a nearer reported reset still pulls the next poll forward.
+# into "unavailable" while the scheduler is deliberately waiting. Ten-minute
+# polling (six requests/hour) stays below the measured per-token budget and
+# detects recovery promptly; a nearer reported reset still pulls the next poll
+# forward.
 EXHAUSTED_INTERVAL_S = 600.0
 
 # A window whose binding pct moved at least this much between polls is being
@@ -228,7 +229,7 @@ def plan_after_fetch(
     next_poll = now + interval * (1.0 + JITTER_FRAC * (2.0 * rng() - 1.0))
     if headroom is not None and headroom <= 0:
         reset_ts = limiting_reset_ts(new_usage, models)
-        if reset_ts is not None:
+        if reset_ts is not None and reset_ts > now:
             next_poll = min(next_poll, reset_ts + RESET_SLACK_S)
     else:
         reset_ts = earliest_future_reset_ts(new_usage, now, models)

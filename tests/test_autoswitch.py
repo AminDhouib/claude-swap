@@ -440,6 +440,26 @@ class TestDecisionTable:
         assert event.earliest_reset_at == "2026-07-03T10:30:00Z"
         assert harness.engine._sleep_until_ts is not None
 
+    @pytest.mark.parametrize("offset", [-60.0, 0.0])
+    def test_all_exhausted_ignores_non_future_reset(self, harness, offset):
+        from datetime import datetime, timezone
+
+        reset = (
+            datetime.fromtimestamp(harness.clock.now + offset, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        outcome = harness.tick_with_usage({
+            "1": _usage(100, reset),
+            "2": _usage(100, reset),
+            "3": _usage(100, reset),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        event = next(e for e in harness.events if isinstance(e, AllExhaustedEvent))
+        assert event.earliest_reset_at is None
+        assert harness.engine._sleep_until_ts is None
+        assert harness.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
+
 
 class TestIdleHold:
     """Active token expired while Claude Code owns it → hold, don't fail over."""
@@ -758,6 +778,26 @@ class TestAdaptiveScheduler:
         assert h.engine._unhealthy_ticks == 0
         assert "1" not in counts  # backoff respected
         assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
+
+    def test_all_exhausted_escalation_preserves_wider_plan(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home, monkeypatch)
+        usage = {num: _usage(100) for num in ("1", "2", "3")}
+        counts: dict[str, int] = {}
+        assert self._tick(h, counts, usage) is TickOutcome.BLOCKED
+        assert counts == {"1": 1, "2": 1, "3": 1}
+
+        # Simulate the wider plan learned after repeated 429s. The next
+        # all-exhausted wake may refresh other stale rows, but escalation must
+        # not defeat this token's congestion-control interval.
+        h.switcher._usage_store.set_poll_plan(
+            {"2": (h.clock.now + 1800.0, 1800.0)},
+            {"2": ("b@example.com", "")},
+        )
+        h.clock.advance(NO_RESET_FALLBACK_S)
+        assert self._tick(h, counts, usage) is TickOutcome.BLOCKED
+        assert counts["2"] == 1
 
     def test_exhausted_candidate_keeps_a_bounded_poll_plan(
         self, temp_home, monkeypatch
@@ -2275,7 +2315,7 @@ class TestConsumeFirstStrategy:
         """
         fetch_sets: list[set] = []
 
-        def collect(fetch=None):
+        def collect(fetch=None, **_kwargs):
             requested = set(fetch or ())
             fetch_sets.append(requested)
             view = fresh if requested == {"1", "2", "3"} else stored

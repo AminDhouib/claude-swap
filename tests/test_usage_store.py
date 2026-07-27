@@ -714,6 +714,24 @@ class TestDueCandidate:
         }
         assert due_candidate(["2"], entries, self.NOW) is None
 
+    def test_parked_plan_is_repaired_after_scoped_model_is_deselected(self):
+        entries = {
+            "2": UsageEntry(
+                last_good={
+                    "five_hour": {"pct": 10.0},
+                    "seven_day": {"pct": 10.0},
+                    "scoped": [{"name": "Fable", "pct": 100.0}],
+                },
+                fetched_at=self.NOW - 400,
+                age_s=400.0,
+                next_poll_at=self.NOW + 86_400,
+                poll_interval_s=300.0,
+            )
+        }
+        # due_candidate has no current scoped-model selection: repair keys on
+        # the impossible deadline shape rather than stale policy semantics.
+        assert due_candidate(["2"], entries, self.NOW) == "2"
+
     def test_none_when_no_candidates(self):
         assert due_candidate([], {}, self.NOW) is None
 
@@ -796,6 +814,29 @@ class TestReserve:
         assert store.reserve(["1"], IDENT, respect_plans=True) == {}
         clock.advance(301)
         assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_overslept_repair_rechecks_current_plan_under_lock(self, store, clock):
+        self._stale(store, clock)
+        store.set_poll_plan({"1": (clock.now + 86_400.0, 300.0)}, IDENT)
+        claims = store.reserve(
+            ["1"], IDENT, respect_plans=True, repair_overslept=True
+        )
+        assert set(claims) == {"1"}
+
+        # A concurrent winner can replace the obsolete plan before this
+        # collector reserves again. The locked predicate sees that valid plan
+        # and does not let repair mode bypass it.
+        assert store.record(
+            {"1": FetchRecord(usage=USAGE)},
+            IDENT,
+            claims,
+            {"1": (clock.now + 300.0, 300.0)},
+        ) == {"1"}
+        clock.advance(SERVE_TTL_S + 1)
+        store.set_poll_plan({"1": (clock.now + 300.0, 300.0)}, IDENT)
+        assert store.reserve(
+            ["1"], IDENT, respect_plans=False, repair_overslept=True
+        ) == {}
 
     def test_scheduler_beats_the_ttl_when_due(self, store, clock):
         # Urgent cadence: a due plan wins even inside the serve TTL for the

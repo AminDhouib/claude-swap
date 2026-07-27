@@ -52,7 +52,7 @@ from claude_swap.poll_policy import (
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import due_candidate, exhausted_plan_oversleeps
+from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -1187,15 +1187,15 @@ class AutoSwitchEngine:
             > poll_policy.ACTIVE_MAX_INTERVAL_S
             and (binding_pct(active_pre.last_good, self._models) or 0.0) < 100.0
         )
-        overslept_exhausted_plan = (
+        overslept_plan = (
             active_pre is not None
-            and exhausted_plan_oversleeps(active_pre, now, self._models)
+            and plan_oversleeps_interval(active_pre, now)
         )
         if (
             active_pre is None
             or active_pre.age_s is None
             or stale_candidate_plan
-            or overslept_exhausted_plan
+            or overslept_plan
             or (
                 active_pre.next_poll_at is not None
                 and now >= active_pre.next_poll_at
@@ -1207,10 +1207,16 @@ class AutoSwitchEngine:
         ):
             plan.add(current)
         if self._idle_hold_since is None:
-            pick = due_candidate(candidates, pre, now, self._models)
+            pick = due_candidate(candidates, pre, now)
             if pick is not None:
                 plan.add(pick)
-        entries = self.switcher.usage_entries_by_account(fetch=plan)
+        entries = self.switcher.usage_entries_by_account(
+            fetch=plan,
+            # A candidate-style plan on the active slot is deliberately
+            # overridden after the active age cap; every other baseline
+            # nomination preserves a valid future plan under the store lock.
+            scheduled=not stale_candidate_plan,
+        )
         usage = {num: entry.decision_value() for num, entry in entries.items()}
 
         active_value = usage.get(current)
@@ -1229,8 +1235,29 @@ class AutoSwitchEngine:
             )
         )
         if escalate:
+            escalation_fetch = {current, *candidates}
+            # Escalation may beat ordinary candidate plans to obtain a fresh
+            # switch decision, but a decision-trusted exhausted row cannot be
+            # a target. Preserve any wider post-429 plan instead of refetching
+            # that token at the bounded all-exhausted wake cadence.
+            for num in tuple(escalation_fetch):
+                entry = entries.get(num)
+                value = usage.get(num)
+                planned_headroom = oauth.account_headroom(
+                    value if isinstance(value, dict) else None, self._models
+                )
+                if (
+                    entry is not None
+                    and entry.next_poll_at is not None
+                    and now < entry.next_poll_at
+                    and (entry.poll_interval_s or 0.0)
+                    > poll_policy.EXHAUSTED_INTERVAL_S
+                    and planned_headroom is not None
+                    and planned_headroom <= 0
+                ):
+                    escalation_fetch.remove(num)
             entries = self.switcher.usage_entries_by_account(
-                fetch={current, *candidates}
+                fetch=escalation_fetch
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
 
@@ -1356,6 +1383,7 @@ class AutoSwitchEngine:
         fallback re-check, rather than sleeping toward another account's
         later known reset."""
         earliest: float | None = None
+        now = self.clock()
         for value in usage.values():
             if not isinstance(value, dict):
                 continue
@@ -1367,7 +1395,7 @@ class AutoSwitchEngine:
             if not blocked:
                 continue  # not exhausted — doesn't gate the blocked state
             usable_at = _limiting_reset_ts(value, self._models)
-            if usable_at is None:
+            if usable_at is None or usable_at <= now:
                 return None  # blocked with unprovable recovery — don't oversleep
             if earliest is None or usable_at < earliest:
                 earliest = usable_at
