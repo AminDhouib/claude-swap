@@ -161,14 +161,16 @@ def session_dir_for(backup_dir: Path, account_num: str, email: str) -> Path:
     return backup_dir / "sessions" / f"{account_num}-{slugify_email(email)}"
 
 
-def keychain_service_name(session_dir: Path) -> str:
+def keychain_service_name(config_dir: Path | str) -> str:
     """Keychain service name Claude Code derives for this config dir.
 
     Claude hashes the raw ``CLAUDE_CONFIG_DIR`` env var value, NFC-normalized
     and unresolved (claude src ``envUtils.ts``/``macOsKeychainHelpers.ts``).
     Hash exactly the string we export — never a resolved/realpath variant.
+    Accepts a ``str`` so a caller holding the raw env value can hash it without
+    a ``Path`` round-trip, which would drop a trailing slash or ``./``.
     """
-    normalized = unicodedata.normalize("NFC", str(session_dir))
+    normalized = unicodedata.normalize("NFC", str(config_dir))
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:8]
     return f"Claude Code-credentials-{digest}"
 
@@ -212,19 +214,32 @@ def read_session_credentials(session_dir: Path) -> str | None:
     writes the hashed entry). Returns ``None`` when the profile has no
     readable credential material.
     """
-    if not session_dir.is_dir():
+    return read_config_dir_credentials(str(session_dir))
+
+
+def read_config_dir_credentials(config_dir: str) -> str | None:
+    """Same read for an arbitrary ``CLAUDE_CONFIG_DIR`` value.
+
+    Takes the raw string rather than a ``Path``: claude derives the keychain
+    service name from the exported value verbatim, so a ``Path`` round-trip —
+    which drops a trailing slash or a leading ``./`` — would look up a service
+    name claude never wrote and fall back to the (possibly stale) plaintext
+    seed instead.
+    """
+    directory = Path(config_dir)
+    if not directory.is_dir():
         return None
     if Platform.detect() == Platform.MACOS:
         try:
             creds = macos_keychain.get_password(
-                keychain_service_name(session_dir), _keychain_account_name()
+                keychain_service_name(config_dir), _keychain_account_name()
             )
             if creds:
                 return creds
         except KeychainError:
             pass  # locked/denied/timeout — the plaintext seed is the next-best truth
     try:
-        return (session_dir / ".credentials.json").read_text(encoding="utf-8")
+        return (directory / ".credentials.json").read_text(encoding="utf-8")
     except (OSError, ValueError):
         # ValueError covers UnicodeDecodeError: a byte-corrupt file is "no
         # readable credential material", not an error to propagate.
