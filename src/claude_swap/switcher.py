@@ -2589,6 +2589,18 @@ class ClaudeAccountSwitcher:
                 account_num, email, creds, is_active=True,
             )
             if outcome.error != "http-401":
+                if outcome.usage is not None:
+                    # The server just accepted this credential. If its
+                    # lineage differs from the slot backup, CC rotated during
+                    # normal use and nothing resynced the backup
+                    # (rotation-before-collection): the backup holds the
+                    # consumed predecessor, and at the next expiry the
+                    # recovery branch would POST that dead grant —
+                    # invalid_grant, and a healthy slot quarantined. Resync
+                    # now, under the same guards as the adopt branch.
+                    self._resync_rotated_backup(
+                        account_num, email, org_uuid, creds
+                    )
                 return FetchRecord(
                     usage=outcome.usage,
                     error=outcome.error,
@@ -2745,11 +2757,31 @@ class ClaudeAccountSwitcher:
                         refresh_input = backup if backup_usable else creds
                     elif live == creds:
                         # Nothing moved since the collector read, but the
-                        # bytes don't match the backup's lineage (a stranded
-                        # consumed generation, or a stale external sync).
-                        # The backup is the slot's real credential — restore
-                        # or refresh from it, never POST the dead live grant.
-                        refresh_input = backup if backup_usable else creds
+                        # bytes don't match the backup's lineage. Two shapes
+                        # share this state, told apart by which generation is
+                        # newer (expiresAt moves forward on every rotation):
+                        # - backup newer → live is a stranded consumed
+                        #   generation or a stale external sync; the backup
+                        #   is the slot's real credential — restore or
+                        #   refresh from it, never POST the dead live grant.
+                        # - live newer → CC rotated during normal use and the
+                        #   fast path never resynced the slot backup
+                        #   (rotation-before-collection); the BACKUP's grant
+                        #   is the consumed one, live's refresh token is the
+                        #   valid successor — POST live, not the backup.
+                        live_exp = (live_oauth or {}).get("expiresAt") or 0
+                        backup_exp = (
+                            backup_oauth.get("expiresAt") or 0
+                            if backup_oauth else 0
+                        )
+                        if (
+                            live_oauth
+                            and live_oauth.get("refreshToken")
+                            and live_exp > backup_exp
+                        ):
+                            refresh_input = live
+                        else:
+                            refresh_input = backup if backup_usable else creds
                     else:
                         # Live moved mid-flight to bytes that are neither
                         # what the collector read nor the backup's lineage —
@@ -2867,6 +2899,78 @@ class ClaudeAccountSwitcher:
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
         )
+
+    def _resync_rotated_backup(
+        self, account_num: str, email: str, org_uuid: str, creds: str
+    ) -> None:
+        """Resync the slot backup after a rotation that completed elsewhere.
+
+        The fresh-token fast path serves usage off a credential the server
+        just accepted. When that credential's lineage differs from the slot
+        backup, Claude Code rotated during normal use and nothing resynced
+        the backup (rotation-before-collection): the backup still holds the
+        consumed predecessor, and the next expiry's recovery branch would
+        POST that dead grant — invalid_grant on a healthy slot. This is the
+        adopt-branch resync extended to a rotation that already completed:
+        same identity re-check, same full-token-pair guard, same locks.
+
+        Best-effort: any failure (lock contention, read error, identity
+        moved) just leaves the backup stale — the newer-generation
+        discriminator in the recovery branch still prevents the dead-grant
+        POST at expiry. Never raises.
+        """
+        try:
+            creds_oauth = oauth.extract_oauth_data(creds)
+            if not (
+                creds_oauth
+                and creds_oauth.get("accessToken")
+                and creds_oauth.get("refreshToken")
+            ):
+                return  # never seed a backup with a partial token pair
+            backup = self._read_account_credentials(account_num, email)
+            if backup and (
+                oauth.credential_fingerprint(creds)
+                == oauth.credential_fingerprint(backup)
+            ):
+                return  # same lineage — nothing drifted
+            with (
+                FileLock(self.lock_file),
+                claude_credentials_lock(),
+            ):
+                # Identity re-check under the lock: a switch/login landing in
+                # the gap means the live store is no longer this account's.
+                identity = self._get_current_account()
+                if identity is None or identity != (email, org_uuid or ""):
+                    return
+                # Re-read live under the lock and require it to still carry
+                # the served credential's lineage with a full pair — resync
+                # the freshest bytes, not a snapshot.
+                live = self._read_credentials()
+                if not live:
+                    return
+                live_oauth = oauth.extract_oauth_data(live)
+                if not (
+                    live_oauth
+                    and live_oauth.get("accessToken")
+                    and live_oauth.get("refreshToken")
+                    and oauth.credential_fingerprint(live)
+                    == oauth.credential_fingerprint(creds)
+                ):
+                    return
+                self._write_account_credentials(account_num, email, live)
+                self._logger.info(
+                    "Resynced account %s's backup to the rotated live "
+                    "credential (rotation completed outside a collect pass).",
+                    account_num,
+                )
+        except LockError:
+            return  # holder is mid-operation; the next pass retries
+        except Exception:
+            self._logger.warning(
+                "Backup resync for account %s failed; the recovery branch's "
+                "newer-generation check still guards the next expiry.",
+                account_num, exc_info=True,
+            )
 
     def _static_usage_sentinel(
         self, account_info: tuple[int, str, str, str, bool, str, str]
