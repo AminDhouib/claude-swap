@@ -643,6 +643,45 @@ class TestSharingPosix:
 
         assert (session_dir / "settings.json").readlink() == source / "settings.json"
 
+    def test_links_to_resolved_target_when_source_is_symlink(
+        self, share_setup, temp_home
+    ):
+        """A dotfiles-managed ~/.claude item is itself a symlink: link straight to
+        its final target so the chain is only ever one hop deep. Claude Code's
+        atomic settings write resolves one hop only, so a link-to-a-link gets its
+        intermediate link replaced by a regular file, silently detaching the user's
+        real source of truth (anthropics/claude-code#78162).
+        """
+        source, session_dir, mgr = share_setup
+        dotfiles = temp_home / "dotfiles"
+        dotfiles.mkdir()
+        real = dotfiles / "settings.json"
+        real.write_text('{"real": true}')
+        link = source / "settings.json"
+        link.unlink()
+        link.symlink_to(real)
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (session_dir / "settings.json").readlink() == real.resolve()
+
+    def test_repoints_existing_link_to_resolved_target(self, share_setup, temp_home):
+        """An already-adopted link pointing at the intermediate symlink is repointed
+        at the final target, not left one hop short."""
+        source, session_dir, mgr = share_setup
+        dotfiles = temp_home / "dotfiles"
+        dotfiles.mkdir()
+        real = dotfiles / "settings.json"
+        real.write_text("{}")
+        link = source / "settings.json"
+        link.unlink()
+        link.symlink_to(real)
+        (session_dir / "settings.json").symlink_to(link)
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (session_dir / "settings.json").readlink() == real.resolve()
+
 
 class TestSharingWindowsMode:
     """Copy mode, exercised by forcing the platform (runs on any host)."""
