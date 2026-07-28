@@ -163,7 +163,9 @@ def usage_freshness_fields(
 ) -> dict:
     """Additive ``usageFetchedAt``/``usageAgeSeconds`` fields describing how
     old the served ``usage`` measurement is (the store may serve last-good
-    data on fetch failure). Emitted only alongside a non-null ``usage``."""
+    data on fetch failure). Emitted under these names only alongside a
+    non-null ``usage``; ``last_good_usage_fields`` reuses them renamed to
+    ``lastGoodFetchedAt``/``lastGoodAgeSeconds`` for null-``usage`` rows."""
     if fetched_at is None:
         return {}
     fields: dict = {
