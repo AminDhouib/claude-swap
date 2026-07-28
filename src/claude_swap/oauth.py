@@ -96,8 +96,15 @@ class RefreshOutcome:
     token_account: dict | None = None
 
 
-def try_refresh_oauth_credentials(credentials: str) -> RefreshOutcome:
-    """Refresh an OAuth access token via direct token endpoint POST."""
+def try_refresh_oauth_credentials(
+    credentials: str, timeout_s: float = 10.0
+) -> RefreshOutcome:
+    """Refresh an OAuth access token via direct token endpoint POST.
+
+    ``timeout_s`` bounds the network exchange. Callers that hold locks other
+    processes contend for should pass a budget comfortably inside the
+    contenders' acquire timeout (see ``_fetch_active_usage``).
+    """
     try:
         data = json.loads(credentials)
     except json.JSONDecodeError:
@@ -122,7 +129,7 @@ def try_refresh_oauth_credentials(credentials: str) -> RefreshOutcome:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             resp_data = json.loads(resp.read().decode())
 
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)

@@ -65,7 +65,7 @@ class SnapshotSource:
         prev: AccountSnapshot | None,
         taken_at: float,
     ) -> AccountSnapshot:
-        if prev is None or _account_identity(acc) != _account_identity(prev):
+        if prev is None or account_identity(acc) != account_identity(prev):
             return acc
 
         prev_fetched = prev.usage.fetched_at
@@ -83,7 +83,13 @@ class SnapshotSource:
         return acc
 
 
-def _account_identity(acc: AccountSnapshot) -> tuple[str, str, str]:
+def account_identity(acc: AccountSnapshot) -> tuple[str, str, str]:
+    """The identity discriminator for a slot across snapshots.
+
+    The single definition of "same account": snapshot reconciliation here and
+    the TUI's snapshot merge must agree, or an identity change (e.g. a slot
+    re-used by another login) is detected by one and missed by the other.
+    """
     return (acc.email, acc.org_uuid, acc.kind)
 
 
