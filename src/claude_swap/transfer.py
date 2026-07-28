@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -95,18 +95,36 @@ def _validate_imported_account(switcher: ClaudeAccountSwitcher, account: dict) -
 
 
 def _atomic_write_file(path: Path, content: str) -> None:
-    """Write text atomically with 0600 perms — same pattern as switcher._write_json."""
+    """Write text atomically with 0600 perms, never exposing plaintext content
+    at a world-readable mode.
+
+    Uses ``tempfile.mkstemp`` (0600 from creation, per the process umask being
+    irrelevant to it) rather than ``Path.write_text`` + a follow-up ``chmod``:
+    the export payload carries live OAuth refresh tokens, and a write-then-
+    chmod sequence leaves the temp file at the umask-derived default mode
+    (typically world-readable) for the window between creation and the chmod
+    call. Same pattern as ``credentials.py``/``settings.py``/``migrations.py``.
+    """
     if path.is_dir():
         raise TransferError(
             f"export destination must be a file path, not a directory: {path}"
         )
-    temp_path = path.with_suffix(f".{os.getpid()}.tmp")
-    temp_path.write_text(content, encoding="utf-8")
-    if sys.platform != "win32":
-        os.chmod(temp_path, 0o600)
-    shutil.move(str(temp_path), str(path))
-    if sys.platform != "win32":
-        os.chmod(path, 0o600)
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        os.write(fd, content.encode("utf-8"))
+        os.close(fd)
+        fd = -1
+        os.replace(tmp_path, str(path))
+        if sys.platform != "win32":
+            os.chmod(str(path), 0o600)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _slim_config(config_obj: dict, label: str) -> dict:
