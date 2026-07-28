@@ -25,7 +25,7 @@ from claude_swap.autoswitch import (
     UnquarantineEvent,
     pct_label,
 )
-from claude_swap.json_output import USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
@@ -512,10 +512,38 @@ class TestIdleHold:
         assert harness.engine._unhealthy_ticks == 1
         assert harness.engine._idle_hold_since is None
 
+    def test_foreign_credential_sentinel_fails_over_instead_of_holding(
+        self, harness
+    ):
+        """The foreign sentinel (live credential proven to be another
+        account's) must NOT idle-hold like TOKEN_EXPIRED: holding preserves
+        the drift, while the failover switch stashes the foreign credential
+        and restores the slot's backup — the switch IS the repair."""
+        foreign = {
+            "1": USAGE_FOREIGN_CREDENTIAL, "2": _usage(10), "3": _usage(20),
+        }
+        assert harness.tick_with_usage(foreign) is TickOutcome.NO_ACTION
+        assert harness.tick_with_usage(foreign) is TickOutcome.NO_ACTION
+        assert harness.tick_with_usage(foreign) is TickOutcome.SWITCHED
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "failover"
+        assert harness.engine._idle_hold_since is None
+
 
 class TestAdaptiveScheduler:
     """End-to-end through the real store: O(1) baseline, escalations,
     skip-to-reset, movement-based cadence."""
+
+    @pytest.fixture(autouse=True)
+    def _no_profile_probe(self):
+        """Collect passes whose active credential drifted from the slot
+        backup probe the profile oracle before resyncing — unpatched, a real
+        HTTP call. "Probe failed" (resync skipped) is inert for scheduler
+        behavior."""
+        with patch(
+            "claude_swap.oauth.fetch_oauth_profile", return_value=None
+        ):
+            yield
 
     def _harness(self, temp_home, monkeypatch, accounts=3, **settings_kwargs):
         monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)

@@ -32,6 +32,14 @@ USAGE_KEYCHAIN_UNAVAILABLE = "keychain unavailable"
 # replaces the credential; distinct from "token expired" (which Claude Code can
 # refresh on its own) because only the user can fix it.
 USAGE_RELOGIN_REQUIRED = "re-login needed"
+# The profile oracle proved the live credential belongs to a DIFFERENT account
+# than the slot's identity (foreign credential under a stale config — partial
+# cross-machine sync or a mid-``/login`` poll). Its quota is not this slot's, so
+# recording it would poison history and autoswitch decisions; distinct from
+# "token expired" because holding is wrong here — a switch repairs the drift
+# (stash the foreign credential, restore the slot's backup), so autoswitch
+# should treat the active as unknown-headroom and fail over.
+USAGE_FOREIGN_CREDENTIAL = "foreign credential"
 
 
 def _window_to_json(entry: dict) -> dict:
@@ -135,6 +143,8 @@ def usage_fields(
     automatically), the ``USAGE_API_KEY`` sentinel
     (managed API-key account, no subscription quota), the
     ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
+    ``USAGE_FOREIGN_CREDENTIAL`` sentinel (live credential proven to belong to
+    another account; usage suppressed, a switch repairs the drift), the
     ``USAGE_NO_CREDENTIALS`` sentinel, or ``None`` (fetch failed). ``fetched_at``
     is forwarded to ``usage_to_json`` for the weekly pace fields (issue #125).
     """
@@ -148,6 +158,8 @@ def usage_fields(
         return "keychain_unavailable", None
     if entry == USAGE_RELOGIN_REQUIRED:
         return "relogin_required", None
+    if entry == USAGE_FOREIGN_CREDENTIAL:
+        return "foreign_credential", None
     if isinstance(entry, str):
         return "no_credentials", None
     return "unavailable", None

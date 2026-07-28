@@ -14,7 +14,7 @@ import pytest
 
 from claude_swap import macos_keychain
 from claude_swap import oauth
-from claude_swap.json_output import USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
@@ -1549,6 +1549,12 @@ class TestActiveAccountRefresh:
         }
     })
 
+    # What the profile oracle resolves for slot 1's own credential
+    # (sequence uuid "uuid-1", no org).
+    _PROFILE_SELF = {
+        "uuid": "uuid-1", "email": "test@example.com", "organizationUuid": None
+    }
+
     def _switcher(self, sample_sequence_data):
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         switcher = ClaudeAccountSwitcher()
@@ -1558,6 +1564,17 @@ class TestActiveAccountRefresh:
 
     def _refresh_ok(self, credentials, **kw):
         return oauth.RefreshOutcome(self._REFRESHED, None)
+
+    @pytest.fixture(autouse=True)
+    def _no_profile_probe(self):
+        """The oracle-checked resync probes ``fetch_oauth_profile`` on any
+        backup-lineage mismatch — unpatched, that is a real HTTP call.
+        Default to "probe failed" (resync skipped); tests exercising the
+        oracle install their own patch inside this one's scope."""
+        with patch(
+            "claude_swap.oauth.fetch_oauth_profile", return_value=None
+        ):
+            yield
 
     def test_expired_refreshes_under_locks_and_persists_both_stores(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -2196,7 +2213,10 @@ class TestActiveAccountRefresh:
         use; the fresh-token fast path serves usage off B while the slot
         backup still holds A (consumed). The fast path must resync the backup
         to B — otherwise at B's expiry the recovery branch POSTs A's dead
-        grant and quarantines a healthy slot."""
+        grant and quarantines a healthy slot. The drifted lineage must first
+        be attributed by the profile oracle (a foreign credential under a
+        stale config looks identical locally); a matching probe licenses the
+        write and is memoized, so a second pass never re-probes."""
         switcher = self._switcher(sample_sequence_data)
 
         with patch.object(
@@ -2207,18 +2227,27 @@ class TestActiveAccountRefresh:
                  return_value=self._EXPIRED,   # stale lineage A
              ), \
              patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value=self._PROFILE_SELF) as mock_probe, \
              patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome({"five_hour": {"pct": 3}})):
             result = switcher._fetch_active_usage(
                 "1", "test@example.com", self._REFRESHED
             )
+            # Second pass with the backup still stale (mock never updates):
+            # the memoized verdict must answer instead of a second probe.
+            switcher._fetch_active_usage(
+                "1", "test@example.com", self._REFRESHED
+            )
 
         assert result.usage == {"five_hour": {"pct": 3}}
         mock_refresh.assert_not_called()   # nothing consumed — pure resync
-        write_backup.assert_called_once_with(
-            "1", "test@example.com", self._REFRESHED
-        )
+        mock_probe.assert_called_once()
+        assert write_backup.call_args_list == [
+            call("1", "test@example.com", self._REFRESHED),
+            call("1", "test@example.com", self._REFRESHED),
+        ]
 
     def test_fresh_fetch_same_lineage_skips_the_resync(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -2242,14 +2271,260 @@ class TestActiveAccountRefresh:
         write_backup.assert_not_called()
         read_live.assert_not_called()   # early fingerprint check short-circuits
 
-    def test_expiry_after_unresynced_rotation_consumes_live_not_backup(
+    def _fresh_drift_pass(self, switcher, probe):
+        """Drive the fresh fast path with a backup-lineage mismatch, with the
+        oracle answering ``probe`` (a return_value or side_effect list)."""
+        kwargs = (
+            {"side_effect": probe} if isinstance(probe, list)
+            else {"return_value": probe}
+        )
+        with patch.object(
+                 switcher, "_read_credentials", return_value=self._REFRESHED
+             ), \
+             patch.object(
+                 switcher, "_read_account_credentials",
+                 return_value=self._EXPIRED,
+             ), \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.fetch_oauth_profile", **kwargs) as mock_probe, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 3}})):
+            result = switcher._fetch_active_usage(
+                "1", "test@example.com", self._REFRESHED
+            )
+        return result, write_backup, mock_probe
+
+    def test_fresh_foreign_probe_mismatch_skips_resync_warns_once_and_caches(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        caplog,
+    ):
+        """A drifted lineage the oracle resolves to a DIFFERENT account is
+        never written into the slot backup (foreign credential under a stale
+        config — the write would destroy the slot's only refresh token), and
+        its usage is suppressed with the foreign sentinel instead of being
+        recorded as this slot's (#117's mis-keying shape). The verdict is
+        cached so the same foreign bytes neither re-probe nor re-warn."""
+        import logging
+
+        switcher = self._switcher(sample_sequence_data)
+        foreign = {
+            "uuid": "uuid-foreign", "email": "other@example.com",
+            "organizationUuid": None,
+        }
+
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            first, write_backup, mock_probe = self._fresh_drift_pass(
+                switcher, foreign
+            )
+            second, write_backup2, mock_probe2 = self._fresh_drift_pass(
+                switcher, foreign
+            )
+
+        assert first.sentinel == USAGE_FOREIGN_CREDENTIAL
+        assert first.usage is None
+        assert second.sentinel == USAGE_FOREIGN_CREDENTIAL
+        write_backup.assert_not_called()
+        write_backup2.assert_not_called()
+        mock_probe.assert_called_once()
+        mock_probe2.assert_not_called()   # verdict cached, no re-probe
+        warnings = [
+            r for r in caplog.records
+            if "resolves to a different account" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+
+    def test_fresh_probe_failure_skips_resync_and_retries_next_pass(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
-        """Rotation-before-collection, phase 2: the resync never happened
-        (best-effort failure) and B reached its expiry with the backup still
-        on A. The recovery branch must discriminate by generation — live B is
-        NEWER than backup A, so B's refresh token is the valid successor and
-        A's grant is the consumed one. POST B; never POST A."""
+        """An unreachable oracle is transient evidence-free failure: the
+        resync is skipped (backup untouched) but nothing is cached — the next
+        pass probes again and heals once the oracle answers."""
+        switcher = self._switcher(sample_sequence_data)
+
+        first, write_backup, mock_probe = self._fresh_drift_pass(
+            switcher, None
+        )
+        second, write_backup2, mock_probe2 = self._fresh_drift_pass(
+            switcher, self._PROFILE_SELF
+        )
+
+        assert first.usage == {"five_hour": {"pct": 3}}
+        write_backup.assert_not_called()
+        mock_probe.assert_called_once()
+        # Next pass re-probes; a matching answer licenses the resync.
+        mock_probe2.assert_called_once()
+        write_backup2.assert_called_once_with(
+            "1", "test@example.com", self._REFRESHED
+        )
+
+    def test_fresh_probe_unverifiable_not_cached(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A slot with no stored uuid and a partial resolved identity cannot
+        be condemned OR confirmed: skip the resync, cache nothing (a cached
+        False on partial evidence would block a legitimate resync for the
+        process lifetime), re-probe next pass."""
+        sample_sequence_data["accounts"]["1"].pop("uuid")
+        switcher = self._switcher(sample_sequence_data)
+        partial = {"uuid": "uuid-x", "email": None, "organizationUuid": None}
+
+        first, write_backup, mock_probe = self._fresh_drift_pass(
+            switcher, partial
+        )
+        second, write_backup2, mock_probe2 = self._fresh_drift_pass(
+            switcher, partial
+        )
+
+        write_backup.assert_not_called()
+        write_backup2.assert_not_called()
+        mock_probe.assert_called_once()
+        mock_probe2.assert_called_once()   # nothing cached — probed again
+        assert switcher._probe_verdicts == {}
+
+    def test_uuid_less_slot_email_match_with_missing_org_is_unverifiable(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Email match alone must not affirm ownership when the resolved org
+        is absent: the same email legitimately exists across personal/org
+        accounts, and a missing org is indistinguishable from a personal
+        account. Unverifiable — no write, no backfill, nothing cached."""
+        sample_sequence_data["accounts"]["1"].pop("uuid")
+        switcher = self._switcher(sample_sequence_data)
+        orgless = {
+            "uuid": "uuid-x", "email": "test@example.com",
+            "organizationUuid": None,
+        }
+
+        first, write_backup, mock_probe = self._fresh_drift_pass(
+            switcher, orgless
+        )
+
+        write_backup.assert_not_called()
+        assert switcher._probe_verdicts == {}
+        assert switcher.account_identity("1")["uuid"] == ""   # no backfill
+        assert first.usage == {"five_hour": {"pct": 3}}   # not condemned
+
+    def test_uuid_less_personal_slot_rejects_same_email_under_foreign_org(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """The same email under a DIFFERENT org is a sibling account, not
+        this slot: definitive foreign — no write, no backfill, verdict
+        cached, usage suppressed."""
+        sample_sequence_data["accounts"]["1"].pop("uuid")
+        switcher = self._switcher(sample_sequence_data)
+        sibling = {
+            "uuid": "uuid-org-sibling", "email": "test@example.com",
+            "organizationUuid": "org-B",
+        }
+
+        first, write_backup, mock_probe = self._fresh_drift_pass(
+            switcher, sibling
+        )
+        second, write_backup2, mock_probe2 = self._fresh_drift_pass(
+            switcher, sibling
+        )
+
+        write_backup.assert_not_called()
+        write_backup2.assert_not_called()
+        assert first.sentinel == USAGE_FOREIGN_CREDENTIAL
+        mock_probe2.assert_not_called()   # False cached
+        assert switcher.account_identity("1")["uuid"] == ""   # no backfill
+
+    def test_uuid_less_slot_exact_email_org_match_resyncs_and_backfills(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A structurally complete (email, org) match on a uuid-less slot is
+        affirmative: resync fires and the resolved uuid is recorded so
+        future verdicts go uuid-positive."""
+        sample_sequence_data["accounts"]["1"].pop("uuid")
+        switcher = self._switcher(sample_sequence_data)
+        complete = {
+            "uuid": "uuid-resolved", "email": "test@example.com",
+            "organizationUuid": "",
+        }
+
+        first, write_backup, mock_probe = self._fresh_drift_pass(
+            switcher, complete
+        )
+
+        assert first.usage == {"five_hour": {"pct": 3}}
+        write_backup.assert_called_once_with(
+            "1", "test@example.com", self._REFRESHED
+        )
+        assert switcher.account_identity("1")["uuid"] == "uuid-resolved"
+
+    def test_lineage_key_binds_the_stored_email_too(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Add-token records keep org and uuid blank, so a stored-email
+        change is the only identity marker a re-creation moves there — the
+        key must move with it, or a stale caller email could resurrect the
+        predecessor's verdict."""
+        sample_sequence_data["accounts"]["1"].pop("uuid")
+        switcher = self._switcher(sample_sequence_data)
+        before = switcher._lineage_key("1", "test@example.com", "fp")
+
+        data = switcher._get_sequence_data()
+        data["accounts"]["1"]["email"] = "new@example.com"
+        switcher._write_json(switcher.sequence_file, data)
+
+        assert switcher._lineage_key("1", "test@example.com", "fp") != before
+
+    def test_verdict_does_not_survive_a_slot_identity_change(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A verdict is bound to the slot's stored identity: a slot
+        re-created for a different account (same number, same email — e.g.
+        across orgs) must not inherit its predecessor's license to consume
+        a lineage at expiry."""
+        switcher = self._switcher(sample_sequence_data)
+        live_b = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-B", "refreshToken": "rt-B",
+                "expiresAt": 2000,
+            }
+        })
+        backup_a = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-A", "refreshToken": "rt-A",
+                "expiresAt": 1000,
+            }
+        })
+        switcher._probe_verdicts[
+            switcher._lineage_key(
+                "1", "test@example.com", oauth.credential_fingerprint(live_b)
+            )
+        ] = True
+        # The slot is re-created for a different account: same number and
+        # email, new uuid.
+        data = switcher._get_sequence_data()
+        data["accounts"]["1"]["uuid"] = "uuid-recreated"
+        switcher._write_json(switcher.sequence_file, data)
+
+        with patch.object(switcher, "_read_credentials", return_value=live_b), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=backup_a
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            result = switcher._fetch_active_usage(
+                "1", "test@example.com", live_b
+            )
+
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        mock_refresh.assert_not_called()   # stale verdict did not license B
+        write_live.assert_not_called()
+        mock_fetch.assert_not_called()
+
+    def test_expiry_after_unresynced_rotation_defers_without_verified_lineage(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Rotation-before-collection, phase 2, cold process: B reached its
+        expiry with the backup still on A and no ownership verdict for B's
+        lineage. Generation ordering alone cannot tell an unresynced own
+        rotation from a foreign credential under a stale config — POSTing B
+        could consume another machine's grant. Defer; never POST A either."""
         switcher = self._switcher(sample_sequence_data)
         live_b = json.dumps({
             "claudeAiOauth": {
@@ -2263,6 +2538,50 @@ class TestActiveAccountRefresh:
                 "expiresAt": 1000,        # the older, consumed generation
             }
         })
+
+        with patch.object(switcher, "_read_credentials", return_value=live_b), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=backup_a
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            result = switcher._fetch_active_usage(
+                "1", "test@example.com", live_b
+            )
+
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        mock_refresh.assert_not_called()
+        write_backup.assert_not_called()
+        write_live.assert_not_called()
+        mock_fetch.assert_not_called()
+
+    def test_expiry_after_unresynced_rotation_consumes_live_when_verified(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Same drift shape, but this process attributed B's lineage (a
+        fresh-pass oracle match whose backup write failed): live B is NEWER
+        than backup A and verified ours, so B's refresh token is the valid
+        successor and A's grant is the consumed one. POST B; never POST A."""
+        switcher = self._switcher(sample_sequence_data)
+        live_b = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-B", "refreshToken": "rt-B",
+                "expiresAt": 2000,        # expired, but newer than A
+            }
+        })
+        backup_a = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-A", "refreshToken": "rt-A-consumed",
+                "expiresAt": 1000,        # the older, consumed generation
+            }
+        })
+        switcher._probe_verdicts[
+            switcher._lineage_key(
+                "1", "test@example.com", oauth.credential_fingerprint(live_b)
+            )
+        ] = True
 
         with patch.object(switcher, "_read_credentials", return_value=live_b), \
              patch.object(
@@ -2290,41 +2609,57 @@ class TestActiveAccountRefresh:
     def test_expiry_after_tolerated_backup_write_failure_consumes_live(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
-        """The tolerated 'backup write failed, live write succeeded' case
-        leaves the same drift shape: live = successor S (newer), backup = the
-        pre-refresh generation (older). At S's expiry the newer-generation
-        discriminator must consume S, not re-POST the old backup grant."""
+        """The tolerated 'backup write failed, live write succeeded' case,
+        end-to-end in one process: pass 1 refreshes and self-attributes the
+        successor S even though the backup write fails; at S's expiry the
+        memoized verdict licenses consuming S — no oracle probe, and never a
+        re-POST of the old backup grant."""
         switcher = self._switcher(sample_sequence_data)
+        # Pass 2's live store: successor lineage rt-new (from _REFRESHED),
+        # its access token now expired.
         live_s = json.dumps({
             "claudeAiOauth": {
-                "accessToken": "sk-S", "refreshToken": "rt-S",
+                "accessToken": "sk-S", "refreshToken": "rt-new",
                 "expiresAt": 3000,        # the successor, now expired
             }
         })
-        backup_old = json.dumps({
+        successor2 = json.dumps({
             "claudeAiOauth": {
-                "accessToken": "sk-old", "refreshToken": "rt-old",
-                "expiresAt": 1000,        # generation consumed by the prior pass
+                "accessToken": "sk-newer", "refreshToken": "rt-newer",
+                "expiresAt": 9999999999000,
             }
         })
+        refresh_results = [
+            oauth.RefreshOutcome(self._REFRESHED, None),
+            oauth.RefreshOutcome(successor2, None),
+        ]
 
-        with patch.object(switcher, "_read_credentials", return_value=live_s), \
+        with patch.object(switcher, "_read_credentials",
+                          side_effect=[self._EXPIRED, live_s]), \
              patch.object(
-                 switcher, "_read_account_credentials", return_value=backup_old
+                 switcher, "_read_account_credentials",
+                 return_value=self._EXPIRED,   # backup never advances
              ), \
              patch.object(switcher, "_write_credentials"), \
-             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_credentials",
+                          side_effect=Exception("disk full")), \
              patch("claude_swap.oauth.try_refresh_oauth_credentials",
-                   side_effect=self._refresh_ok) as mock_refresh, \
+                   side_effect=refresh_results) as mock_refresh, \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
-                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})):
-            result = switcher._fetch_active_usage(
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})), \
+             patch("claude_swap.oauth.fetch_oauth_profile") as mock_probe:
+            first = switcher._fetch_active_usage(
+                "1", "test@example.com", self._EXPIRED
+            )
+            second = switcher._fetch_active_usage(
                 "1", "test@example.com", live_s
             )
 
-        assert result.sentinel is None
-        mock_refresh.assert_called_once()
-        assert mock_refresh.call_args[0][0] == live_s
+        assert first.sentinel is None
+        assert second.sentinel is None
+        assert mock_refresh.call_count == 2
+        assert mock_refresh.call_args_list[1][0][0] == live_s
+        mock_probe.assert_not_called()   # self-attribution needs no oracle
 
     def test_stranded_backup_newer_still_restores_not_consumes_live(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -2499,24 +2834,19 @@ class TestActiveAccountRefresh:
         assert result.sentinel is None
         mock_fetch.assert_not_called()
 
-    def test_adopting_a_cc_rotation_resyncs_the_slot_backup(
-        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
-    ):
-        """When CC won the refresh race, adopting without resyncing the backup
-        re-strands the machine at the NEXT expiry: the rotated live fingerprint
-        no longer matches the stale backup, so the provenance guard would
-        refuse every future refresh. Adoption must persist the adopted
-        credential into the slot backup (identity verified via the config)."""
-        switcher = self._switcher(sample_sequence_data)
-        cc_rotated = json.dumps({
-            "claudeAiOauth": {
-                "accessToken": "sk-cc",
-                "refreshToken": "rt-cc-new",
-                "expiresAt": 9999999999000,
-            }
-        })
+    _CC_ROTATED = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-cc",
+            "refreshToken": "rt-cc-new",
+            "expiresAt": 9999999999000,
+        }
+    })
 
-        with patch.object(switcher, "_read_credentials", return_value=cc_rotated), \
+    def _adopt_pass(self, switcher):
+        """Drive the adopt branch: expired creds, fresh unrelated live."""
+        with patch.object(
+                 switcher, "_read_credentials", return_value=self._CC_ROTATED
+             ), \
              patch.object(
                  switcher, "_read_account_credentials", return_value=self._EXPIRED
              ), \
@@ -2526,15 +2856,77 @@ class TestActiveAccountRefresh:
              patch.object(switcher, "_write_account_credentials") as write_backup, \
              patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
-                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 7}})):
-            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 7}})) as mock_fetch:
+            result = switcher._fetch_active_usage(
+                "1", "test@example.com", self._EXPIRED
+            )
+        return result, write_live, write_backup, mock_refresh, mock_fetch
+
+    def test_adopting_a_cc_rotation_skips_the_resync_without_a_verdict(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A fresh live credential of unknown lineage is adopted for usage
+        (pre-existing behavior) but NOT written into the slot backup: a
+        foreign credential under a stale config satisfies every local
+        condition here, and network is forbidden under these locks. The next
+        fresh pass attributes it via the oracle and heals the backup."""
+        switcher = self._switcher(sample_sequence_data)
+        result, write_live, write_backup, mock_refresh, _ = (
+            self._adopt_pass(switcher)
+        )
+
+        assert result.sentinel is None
+        mock_refresh.assert_not_called()          # adopted, not consumed
+        write_live.assert_not_called()            # live already correct
+        write_backup.assert_not_called()          # lineage unverified
+
+    def test_adopting_a_cc_rotation_resyncs_the_slot_backup_when_verified(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """With an ownership verdict for the rotated lineage (fresh-pass
+        oracle match earlier in this process), adoption must persist the
+        adopted credential into the slot backup — otherwise the NEXT expiry's
+        provenance guard would refuse every future refresh."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._probe_verdicts[
+            switcher._lineage_key(
+                "1", "test@example.com",
+                oauth.credential_fingerprint(self._CC_ROTATED),
+            )
+        ] = True
+        result, write_live, write_backup, mock_refresh, _ = (
+            self._adopt_pass(switcher)
+        )
 
         assert result.sentinel is None
         mock_refresh.assert_not_called()          # adopted, not consumed
         write_live.assert_not_called()            # live already correct
         write_backup.assert_called_once_with(     # lineage continuity restored
-            "1", "test@example.com", cc_rotated
+            "1", "test@example.com", self._CC_ROTATED
         )
+
+    def test_adopting_a_known_foreign_credential_defers(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A lineage the oracle already condemned is neither adopted nor
+        served: usage fetched with it would be another account's, mislabeled
+        as this slot's."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._probe_verdicts[
+            switcher._lineage_key(
+                "1", "test@example.com",
+                oauth.credential_fingerprint(self._CC_ROTATED),
+            )
+        ] = False
+        result, write_live, write_backup, mock_refresh, mock_fetch = (
+            self._adopt_pass(switcher)
+        )
+
+        assert result.sentinel == USAGE_FOREIGN_CREDENTIAL
+        mock_refresh.assert_not_called()
+        write_live.assert_not_called()
+        write_backup.assert_not_called()
+        mock_fetch.assert_not_called()
 
 
 class TestPerformSwitchPostDisplay:
@@ -6247,6 +6639,45 @@ class TestProvenanceGuard:
         assert creds_store[("1", "test@example.com")] == mystery
         assert switcher.list_unclaimed_credentials() == {}
         assert op["warnings"] == []
+        assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == "sk-stale-2"
+
+    def test_cached_foreign_verdict_survives_a_failed_switch_time_probe(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """A collect-pass probe already condemned this lineage (the verdict
+        that routed autoswitch to this very switch). When the switch-time
+        probe then fails transiently, the fail-open pre-fix backup must NOT
+        run — that write is the poisoning the verdict proved. Instead the
+        credential is stashed, the outgoing backup stays untouched, and the
+        switch still completes onto the target."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        foreign = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-foreign", "refreshToken": "rt-foreign",
+        }})
+        switcher._probe_verdicts[
+            switcher._lineage_key(
+                "1", "test@example.com",
+                oauth.credential_fingerprint(foreign),
+            )
+        ] = False
+        live_state = {"creds": foreign}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        # Backup untouched, credential preserved, switch completed.
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        stash = switcher.list_unclaimed_credentials()
+        assert len(stash) == 1
+        assert next(iter(stash.values()))["reason"] == "known-foreign"
+        assert any("previously identified" in w for w in op["warnings"])
         assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == "sk-stale-2"
 
     def test_profile_exception_falls_back_to_pre_fix_backup(
