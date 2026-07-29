@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -738,6 +739,39 @@ class TestFilePermissions:
 
         mode = os.stat(out).st_mode & 0o777
         assert mode == 0o600
+
+    def test_export_temp_file_never_created_world_readable(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The export payload carries a live OAuth refresh token, so the temp
+        file backing it must be 0600 from the instant it is created — never a
+        write-then-chmod sequence that leaves it at the umask-derived default
+        (typically world-readable) for any window. Spies on tempfile.mkstemp
+        (rather than just checking the final path) so this fails loudly if the
+        implementation ever regresses to Path.write_text + a later chmod: a
+        permissive umask that would produce 0o644 under that pattern must
+        still yield 0o600 immediately at creation.
+        """
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        out = temp_home / "x.cswap"
+
+        real_mkstemp = tempfile.mkstemp
+        modes_at_creation = []
+
+        def spying_mkstemp(*args, **kwargs):
+            fd, path = real_mkstemp(*args, **kwargs)
+            modes_at_creation.append(os.fstat(fd).st_mode & 0o777)
+            return fd, path
+
+        monkeypatch.setattr(tempfile, "mkstemp", spying_mkstemp)
+        old_umask = os.umask(0o022)  # permissive: 0o644 if write_text created it
+        try:
+            export_accounts(s, str(out))
+        finally:
+            os.umask(old_umask)
+
+        assert modes_at_creation == [0o600]
 
 
 # ---------------------------------------------------------------------------
