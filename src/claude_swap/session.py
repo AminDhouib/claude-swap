@@ -689,14 +689,22 @@ class SessionManager:
                     self._remove_managed(dest)
                 continue
 
+            # Link to the fully resolved target. When ~/.claude/<name> is itself
+            # a symlink (a dotfiles setup), linking to the unresolved path makes
+            # a link-to-a-link, and Claude Code's atomic settings write — which
+            # resolves only one hop — renames its temp file over the intermediate
+            # link, silently replacing it with a regular file
+            # (anthropics/claude-code#78162).
+            link_target = src.resolve() if src.is_symlink() else src
+
             if dest.is_symlink():
                 if name not in managed:
                     managed = [*managed, name]  # adopt: only cswap links here
                 if use_symlinks:
                     try:
-                        if dest.readlink() != src:
+                        if dest.readlink() != link_target:
                             dest.unlink()
-                            dest.symlink_to(src)
+                            dest.symlink_to(link_target)
                     except OSError:
                         continue
                     new_managed.append(name)
@@ -717,7 +725,7 @@ class SessionManager:
                 if use_symlinks:
                     if dest.exists():
                         self._remove_managed(dest)
-                    dest.symlink_to(src)
+                    dest.symlink_to(link_target)
                 else:
                     if dest.exists():
                         self._remove_managed(dest)
