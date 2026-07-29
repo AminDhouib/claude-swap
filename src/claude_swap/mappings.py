@@ -20,8 +20,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from claude_swap.models import get_timestamp
 from claude_swap.fsutil import replace_with_retry
+from claude_swap.models import get_timestamp
 
 SCHEMA_VERSION = 1
 

@@ -11,9 +11,11 @@ import os
 import sys
 import time
 
-# Windows error codes that mean "someone else has the file open right now",
-# not "this operation is invalid": ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION
-# and ERROR_LOCK_VIOLATION. All three clear on their own within milliseconds.
+# Windows error codes that usually mean "someone else has the file open right
+# now": ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION.
+# AV/indexer contention clears within milliseconds; ERROR_ACCESS_DENIED can
+# also be a persistent condition (ACLs, read-only attribute), which still
+# surfaces once the bounded retries are exhausted.
 _TRANSIENT_WIN_ERRORS = frozenset({5, 32, 33})
 
 
@@ -33,9 +35,13 @@ def replace_with_retry(
     — measured at ~44% of replaces into a scanned temp directory, which made
     credential and usage-store writes fail intermittently for real users.
 
-    Only the transient codes are retried; a genuine error (missing source,
-    cross-device link) surfaces on the first attempt.
+    Only the contention codes are retried; other errors (missing source,
+    cross-device link) surface on the first attempt. A *persistent* access
+    denial (ACLs, read-only target) matches the retried codes and so raises
+    only after the attempt budget — a ~0.75 s delay in the worst case.
     """
+    if attempts < 1:
+        raise ValueError("attempts must be >= 1")
     delay = initial_delay
     for attempt in range(attempts):
         try:

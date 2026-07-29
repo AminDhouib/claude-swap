@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, NoReturn
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import ClaudeCodeLockTimeout, SessionError
+from claude_swap.fsutil import replace_with_retry
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
@@ -58,7 +59,6 @@ from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, list_sessions
 from claude_swap.settings import atomic_write_json
-from claude_swap.fsutil import replace_with_retry
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
