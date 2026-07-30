@@ -2664,3 +2664,72 @@ class TestEveryAccountAboveThreshold:
         )
         sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
+
+
+class TestReviewFindings202:
+    """Three defects found reviewing #202, each reproduced before fixing.
+
+    All three shared a cause worth naming: the code was written against the
+    interval I happened to run (360s) and the account shapes I happened to
+    test, not against the configurable range or the trigger matrix.
+    """
+
+    def _at(self, harness, seconds: float) -> str:
+        from datetime import datetime, timezone
+
+        return (
+            datetime.fromtimestamp(harness.clock.now + seconds, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+    def test_a_short_interval_is_never_lengthened(self, harness):
+        """The default is 60s and the floor is 15s, not the 360s I developed
+        against. max(min(delay, due_in), URGENT) RAISES a delay already below
+        URGENT, so a 15s interval slept 60s — the exact opposite of the
+        'only ever shortens' invariant this function claims."""
+        num = harness.engine.switcher.current_account_number()
+        real = harness.engine.switcher.usage_entries_by_account
+
+        def patched(fetch=frozenset(), **kw):
+            entries = dict(real(fetch=fetch, **kw))
+            entries[num] = replace(entries[num], next_poll_at=harness.clock() + 5.0)
+            return entries
+
+        harness.engine.switcher.usage_entries_by_account = patched
+        harness.engine.settings = replace(
+            harness.engine.settings, interval_seconds=15.0
+        )
+        delay = harness.engine._next_delay(TickOutcome.NO_ACTION)
+        assert delay <= 15.0 * 1.1, f"a 15s interval slept {delay:.1f}s"
+
+    def test_recovery_reads_the_binding_windows_reset(self, harness):
+        """Filtering unusable resets BEFORE taking the max let a lower window
+        answer for the account: 7d at 95% with no reset and 5h at 40% resetting
+        in an hour reported 'back in an hour', which is not what binds."""
+        from claude_swap.autoswitch import _binding_recovery_ts
+
+        now = harness.clock()
+        usage = {
+            "five_hour": {"pct": 40.0, "resets_at": self._at(harness, 3600)},
+            "seven_day": {"pct": 95.0},  # binding, and no reset we can use
+        }
+        assert _binding_recovery_ts(usage, (), now) == float("inf")
+
+    def test_at_limit_still_ranks_by_headroom_when_all_are_above(self, harness):
+        """The gate was scoped to proactive/consume-first; the KEY was not, so
+        at-limit silently re-ranked by soonest-recovery. My earlier at-limit
+        test missed it because its healthy candidate made all_above False —
+        this one keeps every account above the line, which is the combination
+        that reaches the key."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(100, self._at(harness, 60)),    # active, at its limit
+            "2": _usage(91, self._at(harness, 86400)),  # most headroom, far reset
+            "3": _usage(97, self._at(harness, 120)),    # soonest back, less room
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2, (
+            "at-limit must take the most headroom, not the soonest recovery"
+        )
+        sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"

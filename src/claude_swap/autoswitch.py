@@ -425,12 +425,18 @@ def _binding_recovery_ts(
     would otherwise rank a snapshot nobody has refreshed above a measured,
     genuinely imminent one.
     """
-    usable = [
-        (pct, ts)
-        for _label, pct, resets_at in oauth.relevant_windows(usage, models)
-        if (ts := _parse_reset_ts(resets_at)) is not None and ts > now
-    ]
-    return max(usable)[1] if usable else float("inf")  # highest pct wins
+    # Pick the BINDING window first, then ask for its reset. Filtering on the
+    # reset before the max lets a lower window win whenever the binding one's
+    # reset is unknown or past — measured: 7d at 95% with no resets_at and 5h
+    # at 40% resetting in an hour returned "back in an hour", which is the
+    # opposite of what binds. An account whose binding window has no usable
+    # reset is one we cannot schedule around, and inf sorts it last.
+    windows = list(oauth.relevant_windows(usage, models))
+    if not windows:
+        return float("inf")
+    _label, _pct, resets_at = max(windows, key=lambda w: w[1])
+    ts = _parse_reset_ts(resets_at)
+    return ts if ts is not None and ts > now else float("inf")
 
 
 def _every_account_above_threshold(
@@ -1215,11 +1221,17 @@ class AutoSwitchEngine:
                     # qualifies; near-line pairs can't flap back).
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
-            if all_above:
+            if all_above and trigger in ("proactive", "consume-first"):
                 # Soonest BINDING recovery first — the window actually holding
                 # this account back, not the weekly one. With everything in the
                 # 90s the only thing worth optimizing is how long until work can
                 # continue; headroom breaks ties, then sequence order.
+                #
+                # Scoped to the SAME triggers as the gate above. Without the
+                # trigger clause this key also re-ranked at-limit and failover,
+                # which skip that gate deliberately: there the account with the
+                # most headroom must win, because we are escaping a dead or
+                # blocked active account rather than optimising a return time.
                 key: tuple = (recovery_ts, -h)
             elif consume_first:
                 # Soonest weekly reset first (unknown resets sort last), most
@@ -1581,7 +1593,14 @@ class AutoSwitchEngine:
             if entry is None or entry.next_poll_at is None:
                 return delay
             due_in = entry.next_poll_at - self.clock()
-            return max(min(delay, due_in), poll_policy.URGENT_INTERVAL_S)
+            # Clamp the DEADLINE, not the result. max(min(delay, due_in), U)
+            # raises a delay that was ALREADY below U: at the configurable
+            # floor of 15s it turns a 13.5s jittered sleep into 60s, and at
+            # the 60s default it flattens the entire lower jitter half.
+            # Bounding due_in instead keeps "only ever shortens" true at every
+            # configured interval, and still refuses to poll faster than the
+            # planner's own floor when the row is overdue.
+            return min(delay, max(due_in, poll_policy.URGENT_INTERVAL_S))
         except Exception:
             return delay
 
