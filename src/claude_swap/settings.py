@@ -449,20 +449,27 @@ def atomic_write_json(path: Path, data: dict) -> None:
     **Writes THROUGH a symlink, never over it.** A rename swaps a directory
     ENTRY and does not follow links, so renaming onto a symlinked path
     DETACHES the link: the write succeeds, the content is right, and the
-    link target silently stops receiving updates. Where these files are
-    dotfiles-managed (a link into a config repo), the next deploy restores
-    the tracked copy and every change written since the detach is gone —
-    measured in the field as a settings section that vanished while the
-    state it configured stayed live. Same shape as #192/#193, which fixed
-    ``session.py``'s own writer; this is the shared writer behind eight
-    call sites. A DANGLING link still writes where it points (that is what
-    linking it asked for), and the temp file is created beside the
-    RESOLVED path so the rename stays same-filesystem and atomic.
+    link target silently stops receiving updates — until something restores
+    the link (a dotfiles deploy), taking every change written since with
+    it. Same shape as #192/#193, which fixed ``session.py``'s own writer;
+    this is the shared JSON writer. Three consequences, each deliberate:
+
+    - A DANGLING link still writes where it points; linking a path is a
+      request to write there.
+    - The temp file is created beside the RESOLVED target, so the rename
+      stays on one filesystem and remains atomic (beside the LINK it would
+      hit EXDEV whenever the target lives on another mount).
+    - The 0700 hardening stays on the directory cswap owns. Applying it to
+      the resolved parent would narrow a directory belonging to something
+      else, and raise ``PermissionError`` outright when that parent is not
+      ours to chmod. The written file still gets 0600, and ``mkstemp``
+      creates it 0600 to begin with, so the secret is never exposed.
     """
     target = Path(os.path.realpath(path)) if path.is_symlink() else path
     target.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":
-        os.chmod(target.parent, 0o700)
+        # `path.parent`, NOT the target's: see the docstring.
+        os.chmod(path.parent, 0o700)
     fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
     try:
         os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
