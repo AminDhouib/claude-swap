@@ -35,7 +35,7 @@ import logging
 import random
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -77,6 +77,16 @@ NO_RESET_FALLBACK_S = 300.0
 # active user would look identical forever, so after this long the engine
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
+
+# Anti-flap margin for the every-account-above-threshold escape, measured on
+# the axis that escape ranks by: a target must come back at least this much
+# sooner than the account we are leaving. Five minutes is comfortably longer
+# than one poll cycle, so two accounts whose windows roll over close together
+# cannot trade places on measurement jitter — the reverse move never clears
+# the margin. The percentage-point hysteresis is unmeetable in this state by
+# construction (everything is within a few points of its limit), which is why
+# it needs its own unit rather than a reused one.
+RECOVERY_HYSTERESIS_S = 300.0
 
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
@@ -393,6 +403,62 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
             if ts is not None and ts > now:
                 return ts
     return None
+
+
+def _binding_recovery_ts(
+    usage: dict | str | None, models: Sequence[str], now: float
+) -> float:
+    """When this account's *binding* window comes back, as a sort key.
+
+    The binding window is the one holding the account back — the highest
+    utilization among the windows that gate it (the same set
+    ``account_headroom`` measures, so ranking and headroom can never disagree
+    about which window matters). Its reset is the moment the account becomes
+    useful again.
+
+    Not the weekly window: with every account in the 90s the thing that
+    decides where to go is which 5-hour window rolls over first, and that is
+    routinely minutes away while the weekly one is days away.
+
+    Returns ``inf`` when unknown or already past, so such accounts sort last
+    rather than masquerading as "back immediately" — a stale ``resets_at``
+    would otherwise rank a snapshot nobody has refreshed above a measured,
+    genuinely imminent one.
+    """
+    windows = [
+        (pct, _parse_reset_ts(resets_at))
+        for _label, pct, resets_at in oauth.relevant_windows(
+            usage if isinstance(usage, dict) else None, models
+        )
+    ]
+    usable = [(pct, ts) for pct, ts in windows if ts is not None and ts > now]
+    if not usable:
+        return float("inf")
+    return max(usable)[1]  # highest pct wins; its reset is the answer
+
+
+def _every_account_above_threshold(
+    current: str,
+    candidates: Sequence[str],
+    headroom: dict[str, float | None],
+    active_headroom: float | None,
+    threshold: float,
+) -> bool:
+    """Whether the active account AND every measured candidate are at or over
+    the threshold — the state where "land somewhere healthy" has no answer.
+
+    Requires the active account's own headroom to be known: without it we do
+    not know we are in this state, and guessing here would relax the landing
+    rule on an ordinary tick. An unmeasured candidate does not block the
+    verdict (it may be healthy, but it cannot be *chosen* either — the caller
+    skips ``None`` headroom) as long as at least one candidate was measured.
+    """
+    if active_headroom is None or (100.0 - active_headroom) < threshold:
+        return False
+    measured = [headroom.get(n) for n in candidates if headroom.get(n) is not None]
+    if not measured:
+        return False
+    return all((100.0 - h) >= threshold for h in measured)
 
 
 def _ref(number: str, email: str) -> dict:
@@ -1071,6 +1137,26 @@ class AutoSwitchEngine:
         active_reset_ts = (
             _seven_day_reset_ts(usage.get(current), now) if consume_first else None
         )
+        # When NOTHING is below the threshold — the active account and every
+        # candidate all in the 90s — "land somewhere healthy" has no answer,
+        # and holding out for one costs the user the session. Sitting still
+        # means burning the active account to 100% and taking a hard limit,
+        # with the peer that resets in 8 minutes never tried. So in that state
+        # the goal changes from "most headroom" to "soonest back": move to
+        # whichever account recovers first and keep working through its reset.
+        #
+        # Deliberately narrow. It engages only when every measured OAuth
+        # account is at/over the threshold, so a single healthy peer still
+        # wins the normal way, and the hysteresis margin below still applies
+        # so two accounts in the 90s cannot ping-pong.
+        all_above = _every_account_above_threshold(
+            current, oauth_candidates, headroom, active_headroom, settings.threshold
+        )
+        active_recovery_ts = (
+            _binding_recovery_ts(usage.get(current), self._models, now)
+            if all_above
+            else float("inf")
+        )
         qualifying: list[tuple[tuple, str]] = []
         any_known = False
         for num in oauth_candidates:
@@ -1088,7 +1174,7 @@ class AutoSwitchEngine:
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold:
+                if (100.0 - h) >= settings.threshold and not all_above:
                     continue
                 if consume_first:
                     # Purely proactive on reset ordering: below the threshold,
@@ -1101,16 +1187,39 @@ class AutoSwitchEngine:
                         or reset_ts >= active_reset_ts
                     ):
                         continue
+                elif all_above:
+                    # Hysteresis measured on the axis we are actually ranking.
+                    # A headroom margin is unmeetable here by construction —
+                    # everything is in the last few percent, so no candidate
+                    # can be 10 points better — and applying it would block
+                    # the escape it is not protecting. The flap it exists to
+                    # prevent is still prevented: the target must come back
+                    # meaningfully sooner than where we are, so the reverse
+                    # move never qualifies.
+                    if (
+                        _binding_recovery_ts(usage.get(num), self._models, now)
+                        >= active_recovery_ts - RECOVERY_HYSTERESIS_S
+                    ):
+                        continue
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
                     # qualifies; near-line pairs can't flap back).
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
-            if consume_first:
+            if all_above:
+                # Soonest BINDING recovery first — the window actually holding
+                # this account back, not the weekly one. With everything in the
+                # 90s the only thing worth optimizing is how long until work can
+                # continue; headroom breaks ties, then sequence order.
+                key: tuple = (
+                    _binding_recovery_ts(usage.get(num), self._models, now),
+                    -h,
+                )
+            elif consume_first:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
-                key: tuple = (reset_ts if reset_ts is not None else float("inf"), -h)
+                key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
                 key = (-h,)
             qualifying.append((key, num))

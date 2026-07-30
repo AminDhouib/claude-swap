@@ -2514,3 +2514,115 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
+
+
+class TestEveryAccountAboveThreshold:
+    """With nothing below the threshold, go to whatever comes back soonest.
+
+    The state that motivated this was measured, not imagined: all three
+    accounts' 5-hour windows at 100/99/95%, threshold 90. Every candidate
+    failed the "landing must be healthy" gate, so the engine sat still while
+    the active account burned to 100% and Claude Code took a hard session
+    limit — with a peer whose window reset in 8 minutes never tried. Claude
+    Code's own retry timer is driven by the rate-limit headers it already
+    received, so once that limit lands no credential swap can shorten it; the
+    only cure is not to arrive there.
+
+    Below the threshold nothing changes: a single healthy peer still wins the
+    normal way, and the hysteresis margin still keeps two near-line accounts
+    from ping-ponging.
+    """
+
+    def _at(self, harness, seconds: float) -> str:
+        from datetime import datetime, timezone
+
+        return (
+            datetime.fromtimestamp(harness.clock.now + seconds, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+    def test_moves_to_the_soonest_recovering_account(self, harness):
+        """The measured shape: active 99, peers 100 and 95. Account 3 is the
+        only one both viable and soon, and it is where we must land."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(99, self._at(harness, 3600 * 2)),   # active, back in 2h
+            "2": _usage(100, self._at(harness, 600)),       # at limit — never a target
+            "3": _usage(95, self._at(harness, 480)),        # back in 8 minutes
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_soonest_wins_over_most_headroom(self, harness):
+        """Ranking flips in this state: the usual "most headroom" pick is the
+        wrong one when every account is nearly spent — what matters is which
+        one can work again first."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(99, self._at(harness, 3600)),
+            "2": _usage(91, self._at(harness, 3600 * 3)),  # most headroom, latest back
+            "3": _usage(97, self._at(harness, 300)),       # least headroom, soonest back
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_a_single_healthy_peer_still_wins_normally(self, harness):
+        """The escape must not fire while an ordinary target exists."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(99, self._at(harness, 3600)),
+            "2": _usage(95, self._at(harness, 60)),   # soonest, but still spent
+            "3": _usage(20, self._at(harness, 3600 * 5)),  # healthy
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_below_threshold_is_untouched(self, harness):
+        """Nothing about the ordinary below-threshold path changes."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(50), "2": _usage(10), "3": _usage(10),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+
+    def test_all_at_limit_still_reports_exhausted(self, harness):
+        """h <= 0 is still never a target: with everything truly maxed there
+        is nowhere to go and the exhausted path must still own that case."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(100, self._at(harness, 600)),
+            "2": _usage(100, self._at(harness, 300)),
+            "3": _usage(100, self._at(harness, 900)),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert harness.active_number() == 1
+
+    def test_unknown_reset_sorts_last_not_first(self, harness):
+        """A candidate whose reset nobody knows must not masquerade as
+        'back immediately' and beat a measured, genuinely imminent one."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(99, self._at(harness, 3600)),
+            "2": _usage(95),                          # no resets_at at all
+            "3": _usage(97, self._at(harness, 600)),  # known, soon
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_does_not_flap_between_two_near_equal_accounts(self, harness):
+        """The escape relaxes the percentage-point hysteresis, so it owes the
+        anti-flap guarantee on its own axis: two accounts whose windows roll
+        over at nearly the same time must not trade places forever."""
+        a = self._at(harness, 600)
+        b = self._at(harness, 660)  # 60s apart — inside RECOVERY_HYSTERESIS_S
+        first = harness.tick_with_usage({
+            "1": _usage(99, a), "2": _usage(98, b), "3": _usage(100, a),
+        })
+        assert first is TickOutcome.BLOCKED, "60s sooner is not worth a switch"
+        assert harness.active_number() == 1
+
+    def test_a_meaningfully_sooner_account_still_wins(self, harness):
+        """The margin must not be so wide it swallows the real case."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(99, self._at(harness, 3600)),
+            "2": _usage(98, self._at(harness, 600)),  # an hour sooner
+            "3": _usage(100, self._at(harness, 60)),  # at limit — not a target
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
