@@ -35,7 +35,7 @@ import logging
 import random
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -77,6 +77,16 @@ NO_RESET_FALLBACK_S = 300.0
 # active user would look identical forever, so after this long the engine
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
+
+# Anti-flap margin for the every-account-above-threshold escape, measured on
+# the axis that escape ranks by: a target must come back at least this much
+# sooner than the account we are leaving. Five minutes is comfortably longer
+# than one poll cycle, so two accounts whose windows roll over close together
+# cannot trade places on measurement jitter — the reverse move never clears
+# the margin. The percentage-point hysteresis is unmeetable in this state by
+# construction (everything is within a few points of its limit), which is why
+# it needs its own unit rather than a reused one.
+RECOVERY_HYSTERESIS_S = 300.0
 
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
@@ -393,6 +403,63 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
             if ts is not None and ts > now:
                 return ts
     return None
+
+
+def _binding_recovery_ts(
+    usage: dict | str | None, models: Sequence[str], now: float
+) -> float:
+    """When this account's *binding* window comes back, as a sort key.
+
+    The binding window is the one holding the account back — the highest
+    utilization among the windows that gate it (the same set
+    ``account_headroom`` measures, so ranking and headroom can never disagree
+    about which window matters). Its reset is the moment the account becomes
+    useful again.
+
+    Not the weekly window: with every account in the 90s the thing that
+    decides where to go is which 5-hour window rolls over first, and that is
+    routinely minutes away while the weekly one is days away.
+
+    Returns ``inf`` when unknown or already past, so such accounts sort last
+    rather than masquerading as "back immediately" — a stale ``resets_at``
+    would otherwise rank a snapshot nobody has refreshed above a measured,
+    genuinely imminent one.
+    """
+    # Pick the BINDING window first, then ask for its reset. Filtering on the
+    # reset before the max lets a lower window win whenever the binding one's
+    # reset is unknown or past — measured: 7d at 95% with no resets_at and 5h
+    # at 40% resetting in an hour returned "back in an hour", which is the
+    # opposite of what binds. An account whose binding window has no usable
+    # reset is one we cannot schedule around, and inf sorts it last.
+    windows = list(oauth.relevant_windows(usage, models))
+    if not windows:
+        return float("inf")
+    _label, _pct, resets_at = max(windows, key=lambda w: w[1])
+    ts = _parse_reset_ts(resets_at)
+    return ts if ts is not None and ts > now else float("inf")
+
+
+def _every_account_above_threshold(
+    candidates: Sequence[str],
+    headroom: dict[str, float | None],
+    active_headroom: float | None,
+    threshold: float,
+) -> bool:
+    """Whether the active account AND every measured candidate are at or over
+    the threshold — the state where "land somewhere healthy" has no answer.
+
+    Requires the active account's own headroom to be known: without it we do
+    not know we are in this state, and guessing here would relax the landing
+    rule on an ordinary tick. An unmeasured candidate does not block the
+    verdict (it may be healthy, but it cannot be *chosen* either — the caller
+    skips ``None`` headroom) as long as at least one candidate was measured.
+    """
+    if active_headroom is None or (100.0 - active_headroom) < threshold:
+        return False
+    measured = [headroom.get(n) for n in candidates if headroom.get(n) is not None]
+    if not measured:
+        return False
+    return all((100.0 - h) >= threshold for h in measured)
 
 
 def _ref(number: str, email: str) -> dict:
@@ -1071,6 +1138,26 @@ class AutoSwitchEngine:
         active_reset_ts = (
             _seven_day_reset_ts(usage.get(current), now) if consume_first else None
         )
+        # When NOTHING is below the threshold — the active account and every
+        # candidate all in the 90s — "land somewhere healthy" has no answer,
+        # and holding out for one costs the user the session. Sitting still
+        # means burning the active account to 100% and taking a hard limit,
+        # with the peer that resets in 8 minutes never tried. So in that state
+        # the goal changes from "most headroom" to "soonest back": move to
+        # whichever account recovers first and keep working through its reset.
+        #
+        # Deliberately narrow. It engages only when every measured OAuth
+        # account is at/over the threshold, so a single healthy peer still
+        # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
+        # percentage-point margin so two accounts in the 90s cannot ping-pong.
+        all_above = _every_account_above_threshold(
+            oauth_candidates, headroom, active_headroom, settings.threshold
+        )
+        active_recovery_ts = (
+            _binding_recovery_ts(usage.get(current), self._models, now)
+            if all_above
+            else 0.0  # unread unless all_above; never a live sentinel
+        )
         qualifying: list[tuple[tuple, str]] = []
         any_known = False
         for num in oauth_candidates:
@@ -1083,14 +1170,41 @@ class AutoSwitchEngine:
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
+            recovery_ts = (
+                _binding_recovery_ts(usage.get(num), self._models, now)
+                if all_above
+                else 0.0
+            )
             if trigger in ("proactive", "consume-first"):
                 # Landing must be healthy: an account at/over the threshold
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold:
+                if (100.0 - h) >= settings.threshold and not all_above:
                     continue
-                if consume_first:
+                if all_above:
+                    # Checked before the strategies, because with nothing below
+                    # the threshold the strategy question is moot: consume-first
+                    # exists to spend perishable WEEKLY quota, and every account
+                    # here is blocked on a window that returns in minutes. Both
+                    # strategies want the same thing — the account that can work
+                    # again first — so both take this gate and the matching key
+                    # below. (Ordering matters: `if consume_first` catching
+                    # first filtered on weekly ordering while the key sorted on
+                    # binding recovery, two different axes, and left
+                    # consume-first users with no anti-flap guard at all.)
+                    #
+                    # Hysteresis measured on the axis we actually rank by. A
+                    # headroom margin is unmeetable here by construction —
+                    # everything is in the last few percent, so no candidate can
+                    # be 10 points better — and applying it would block the
+                    # escape rather than protect anything. The flap it exists to
+                    # prevent is still prevented: the target must come back
+                    # meaningfully sooner than where we are, so the reverse move
+                    # never qualifies.
+                    if recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S:
+                        continue
+                elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
                     # only move to accounts whose weekly window resets sooner
                     # than the active one (above the threshold we must move, so
@@ -1107,10 +1221,22 @@ class AutoSwitchEngine:
                     # qualifies; near-line pairs can't flap back).
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
-            if consume_first:
+            if all_above and trigger in ("proactive", "consume-first"):
+                # Soonest BINDING recovery first — the window actually holding
+                # this account back, not the weekly one. With everything in the
+                # 90s the only thing worth optimizing is how long until work can
+                # continue; headroom breaks ties, then sequence order.
+                #
+                # Scoped to the SAME triggers as the gate above. Without the
+                # trigger clause this key also re-ranked at-limit and failover,
+                # which skip that gate deliberately: there the account with the
+                # most headroom must win, because we are escaping a dead or
+                # blocked active account rather than optimising a return time.
+                key: tuple = (recovery_ts, -h)
+            elif consume_first:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
-                key: tuple = (reset_ts if reset_ts is not None else float("inf"), -h)
+                key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
                 key = (-h,)
             qualifying.append((key, num))
@@ -1445,7 +1571,38 @@ class AutoSwitchEngine:
             # resumes one slow tick after they do.
             return max(interval, NO_RESET_FALLBACK_S)
         # ±10% jitter so multiple machines don't synchronize their API hits.
-        return interval * (0.9 + 0.2 * random.random())
+        return self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
+
+    def _respect_poll_plan(self, delay: float) -> float:
+        """Shorten a normal-cadence sleep to the store's own next-poll time.
+
+        The planner tightens the active row to URGENT_INTERVAL_S while it
+        burns toward the threshold, but the loop always slept
+        ``interval_seconds`` — so the plan ran late. Measured mid-episode: the
+        row was due 112s ago while the engine still had minutes of sleep left.
+
+        Only ever shortens, never below the planner's floor: the 429 budget
+        lives in the plan, and this makes the loop obey it rather than
+        override it. Best-effort — the unshortened delay is always safe.
+        """
+        try:
+            current = self.switcher.current_account_number()
+            if current is None:
+                return delay
+            entry = self.switcher.usage_entries_by_account(fetch=set()).get(current)
+            if entry is None or entry.next_poll_at is None:
+                return delay
+            due_in = entry.next_poll_at - self.clock()
+            # Clamp the DEADLINE, not the result. max(min(delay, due_in), U)
+            # raises a delay that was ALREADY below U: at the configurable
+            # floor of 15s it turns a 13.5s jittered sleep into 60s, and at
+            # the 60s default it flattens the entire lower jitter half.
+            # Bounding due_in instead keeps "only ever shortens" true at every
+            # configured interval, and still refuses to poll faster than the
+            # planner's own floor when the row is overdue.
+            return min(delay, max(due_in, poll_policy.URGENT_INTERVAL_S))
+        except Exception:
+            return delay
 
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""
