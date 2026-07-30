@@ -1445,7 +1445,39 @@ class AutoSwitchEngine:
             # resumes one slow tick after they do.
             return max(interval, NO_RESET_FALLBACK_S)
         # ±10% jitter so multiple machines don't synchronize their API hits.
-        return interval * (0.9 + 0.2 * random.random())
+        return self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
+
+    def _respect_poll_plan(self, delay: float) -> float:
+        """Shorten a normal-cadence sleep to the store's own next-poll time.
+
+        The planner and the loop used to disagree about time. When the active
+        account burns near the threshold the planner tightens its row to
+        URGENT_INTERVAL_S (60s) so the crossing is caught quickly — but the
+        loop always slept ``interval_seconds`` (360s by default), so that plan
+        could not be honoured and the row simply ran late. Measured on this
+        machine mid-episode: the active row asked to be polled 112s ago while
+        the engine still had minutes of sleep left, and the account sat over
+        the threshold until the user restarted the engine by hand.
+
+        Only ever shortens, and never below the planner's own floor, so this
+        cannot raise the request rate above what the plan already allows —
+        the 429 budget lives in the plan, and this makes the loop obey it
+        rather than overriding it.
+
+        Best-effort: a store read that fails must not stop the loop, and the
+        unshortened delay is always a safe answer.
+        """
+        try:
+            current = self.switcher.current_account_number()
+            if current is None:
+                return delay
+            entry = self.switcher.usage_entries_by_account(fetch=set()).get(current)
+            if entry is None or entry.next_poll_at is None:
+                return delay
+            due_in = entry.next_poll_at - self.clock()
+            return max(min(delay, due_in), poll_policy.URGENT_INTERVAL_S)
+        except Exception:
+            return delay
 
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""

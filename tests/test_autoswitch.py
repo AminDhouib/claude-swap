@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1513,6 +1514,68 @@ class TestRunLoop:
             harness.engine._next_delay(TickOutcome.BLOCKED)
             == poll_policy.EXHAUSTED_INTERVAL_S
         )
+
+
+class TestLoopObeysThePollPlan:
+    """The loop must not oversleep the plan the planner wrote.
+
+    When the active account burns near the threshold the planner tightens its
+    row to URGENT_INTERVAL_S so the crossing is caught quickly. The loop used
+    to sleep ``interval_seconds`` regardless, so on any machine configured
+    slower than the plan (360s here, the default) that plan could not be
+    honoured: measured on the linux box mid-episode, the active row asked to
+    be polled 112s ago while the engine still had minutes of sleep left, and
+    the account sat over the threshold until the engine was restarted by hand.
+    """
+
+    def _plan(self, harness, *, due_in: float) -> None:
+        num = harness.engine.switcher.current_account_number()
+        real = harness.engine.switcher.usage_entries_by_account
+
+        def patched(fetch=frozenset(), **kw):
+            entries = dict(real(fetch=fetch, **kw))
+            entries[num] = replace(
+                entries[num], next_poll_at=harness.clock() + due_in
+            )
+            return entries
+
+        harness.engine.switcher.usage_entries_by_account = patched
+
+    def test_sleep_is_cut_to_the_rows_next_poll(self, harness):
+        harness.engine.settings = replace(
+            harness.engine.settings, interval_seconds=360.0
+        )
+        self._plan(harness, due_in=60.0)
+        # Pre-fix this returned ~360s and the 60s plan silently ran late.
+        assert harness.engine._next_delay(TickOutcome.NO_ACTION) == 60.0
+
+    def test_never_sleeps_below_the_planners_own_floor(self, harness):
+        """A row already overdue must not spin: the floor is the rate budget."""
+        harness.engine.settings = replace(
+            harness.engine.settings, interval_seconds=360.0
+        )
+        self._plan(harness, due_in=-500.0)
+        assert (
+            harness.engine._next_delay(TickOutcome.NO_ACTION)
+            == poll_policy.URGENT_INTERVAL_S
+        )
+
+    def test_a_relaxed_plan_never_lengthens_the_sleep(self, harness):
+        """Only ever shortens — a distant plan must not stretch the cadence
+        past what the user configured."""
+        harness.engine.settings = replace(
+            harness.engine.settings, interval_seconds=60.0
+        )
+        self._plan(harness, due_in=3600.0)
+        assert harness.engine._next_delay(TickOutcome.NO_ACTION) <= 1.1 * 60
+
+    def test_a_store_failure_leaves_the_cadence_alone(self, harness):
+        def boom(*a, **k):
+            raise RuntimeError("store unreadable")
+
+        harness.engine.switcher.usage_entries_by_account = boom
+        delay = harness.engine._next_delay(TickOutcome.NO_ACTION)
+        assert 0.9 * 60 <= delay <= 1.1 * 60
 
 
 class TestSessionThreshold:
