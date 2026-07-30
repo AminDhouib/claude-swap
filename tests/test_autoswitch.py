@@ -2648,3 +2648,19 @@ class TestEveryAccountAboveThreshold:
             "consume-first skipped the recovery hysteresis"
         )
         assert h.active_number() == 1
+
+    def test_at_limit_trigger_still_ignores_the_landing_rule(self, harness):
+        """at-limit and failover skip the whole proactive block. The escape
+        must not have made the active account's 100% case *narrower* — an
+        account with real headroom still wins there regardless of resets."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(100, self._at(harness, 60)),   # active, at limit
+            "2": _usage(30, self._at(harness, 86400)),  # healthy but far reset
+            "3": _usage(95, self._at(harness, 120)),    # soon but spent
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2, (
+            "at-limit must still take the account with real headroom"
+        )
+        sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
