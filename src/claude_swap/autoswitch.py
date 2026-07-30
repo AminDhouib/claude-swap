@@ -425,20 +425,15 @@ def _binding_recovery_ts(
     would otherwise rank a snapshot nobody has refreshed above a measured,
     genuinely imminent one.
     """
-    windows = [
-        (pct, _parse_reset_ts(resets_at))
-        for _label, pct, resets_at in oauth.relevant_windows(
-            usage if isinstance(usage, dict) else None, models
-        )
+    usable = [
+        (pct, ts)
+        for _label, pct, resets_at in oauth.relevant_windows(usage, models)
+        if (ts := _parse_reset_ts(resets_at)) is not None and ts > now
     ]
-    usable = [(pct, ts) for pct, ts in windows if ts is not None and ts > now]
-    if not usable:
-        return float("inf")
-    return max(usable)[1]  # highest pct wins; its reset is the answer
+    return max(usable)[1] if usable else float("inf")  # highest pct wins
 
 
 def _every_account_above_threshold(
-    current: str,
     candidates: Sequence[str],
     headroom: dict[str, float | None],
     active_headroom: float | None,
@@ -1147,15 +1142,15 @@ class AutoSwitchEngine:
         #
         # Deliberately narrow. It engages only when every measured OAuth
         # account is at/over the threshold, so a single healthy peer still
-        # wins the normal way, and the hysteresis margin below still applies
-        # so two accounts in the 90s cannot ping-pong.
+        # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
+        # percentage-point margin so two accounts in the 90s cannot ping-pong.
         all_above = _every_account_above_threshold(
-            current, oauth_candidates, headroom, active_headroom, settings.threshold
+            oauth_candidates, headroom, active_headroom, settings.threshold
         )
         active_recovery_ts = (
             _binding_recovery_ts(usage.get(current), self._models, now)
             if all_above
-            else float("inf")
+            else 0.0  # unread unless all_above; never a live sentinel
         )
         qualifying: list[tuple[tuple, str]] = []
         any_known = False
@@ -1168,6 +1163,11 @@ class AutoSwitchEngine:
                 continue  # itself at its limit — never a target
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
+            )
+            recovery_ts = (
+                _binding_recovery_ts(usage.get(num), self._models, now)
+                if all_above
+                else 0.0
             )
             if trigger in ("proactive", "consume-first"):
                 # Landing must be healthy: an account at/over the threshold
@@ -1196,10 +1196,7 @@ class AutoSwitchEngine:
                     # prevent is still prevented: the target must come back
                     # meaningfully sooner than where we are, so the reverse
                     # move never qualifies.
-                    if (
-                        _binding_recovery_ts(usage.get(num), self._models, now)
-                        >= active_recovery_ts - RECOVERY_HYSTERESIS_S
-                    ):
+                    if recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S:
                         continue
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
@@ -1212,10 +1209,7 @@ class AutoSwitchEngine:
                 # this account back, not the weekly one. With everything in the
                 # 90s the only thing worth optimizing is how long until work can
                 # continue; headroom breaks ties, then sequence order.
-                key: tuple = (
-                    _binding_recovery_ts(usage.get(num), self._models, now),
-                    -h,
-                )
+                key: tuple = (recovery_ts, -h)
             elif consume_first:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
@@ -1559,22 +1553,14 @@ class AutoSwitchEngine:
     def _respect_poll_plan(self, delay: float) -> float:
         """Shorten a normal-cadence sleep to the store's own next-poll time.
 
-        The planner and the loop used to disagree about time. When the active
-        account burns near the threshold the planner tightens its row to
-        URGENT_INTERVAL_S (60s) so the crossing is caught quickly — but the
-        loop always slept ``interval_seconds`` (360s by default), so that plan
-        could not be honoured and the row simply ran late. Measured on this
-        machine mid-episode: the active row asked to be polled 112s ago while
-        the engine still had minutes of sleep left, and the account sat over
-        the threshold until the user restarted the engine by hand.
+        The planner tightens the active row to URGENT_INTERVAL_S while it
+        burns toward the threshold, but the loop always slept
+        ``interval_seconds`` — so the plan ran late. Measured mid-episode: the
+        row was due 112s ago while the engine still had minutes of sleep left.
 
-        Only ever shortens, and never below the planner's own floor, so this
-        cannot raise the request rate above what the plan already allows —
-        the 429 budget lives in the plan, and this makes the loop obey it
-        rather than overriding it.
-
-        Best-effort: a store read that fails must not stop the loop, and the
-        unshortened delay is always a safe answer.
+        Only ever shortens, never below the planner's floor: the 429 budget
+        lives in the plan, and this makes the loop obey it rather than
+        override it. Best-effort — the unshortened delay is always safe.
         """
         try:
             current = self.switcher.current_account_number()
