@@ -1176,7 +1176,29 @@ class AutoSwitchEngine:
                 # headroom beats a blocked or dead one.
                 if (100.0 - h) >= settings.threshold and not all_above:
                     continue
-                if consume_first:
+                if all_above:
+                    # Checked before the strategies, because with nothing below
+                    # the threshold the strategy question is moot: consume-first
+                    # exists to spend perishable WEEKLY quota, and every account
+                    # here is blocked on a window that returns in minutes. Both
+                    # strategies want the same thing — the account that can work
+                    # again first — so both take this gate and the matching key
+                    # below. (Ordering matters: `if consume_first` catching
+                    # first filtered on weekly ordering while the key sorted on
+                    # binding recovery, two different axes, and left
+                    # consume-first users with no anti-flap guard at all.)
+                    #
+                    # Hysteresis measured on the axis we actually rank by. A
+                    # headroom margin is unmeetable here by construction —
+                    # everything is in the last few percent, so no candidate can
+                    # be 10 points better — and applying it would block the
+                    # escape rather than protect anything. The flap it exists to
+                    # prevent is still prevented: the target must come back
+                    # meaningfully sooner than where we are, so the reverse move
+                    # never qualifies.
+                    if recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S:
+                        continue
+                elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
                     # only move to accounts whose weekly window resets sooner
                     # than the active one (above the threshold we must move, so
@@ -1186,17 +1208,6 @@ class AutoSwitchEngine:
                         or active_reset_ts is None
                         or reset_ts >= active_reset_ts
                     ):
-                        continue
-                elif all_above:
-                    # Hysteresis measured on the axis we are actually ranking.
-                    # A headroom margin is unmeetable here by construction —
-                    # everything is in the last few percent, so no candidate
-                    # can be 10 points better — and applying it would block
-                    # the escape it is not protecting. The flap it exists to
-                    # prevent is still prevented: the target must come back
-                    # meaningfully sooner than where we are, so the reverse
-                    # move never qualifies.
-                    if recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S:
                         continue
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the

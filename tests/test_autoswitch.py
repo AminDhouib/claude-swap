@@ -2626,3 +2626,25 @@ class TestEveryAccountAboveThreshold:
         })
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 2
+
+    def test_consume_first_gets_the_same_anti_flap_guard(self, temp_home):
+        """The escape must not depend on which strategy is configured.
+
+        `if consume_first:` used to catch first, so a consume-first user
+        reached the ranking (soonest binding recovery) without ever passing
+        the recovery-hysteresis gate — filtering on one axis while sorting on
+        another. Two accounts whose windows roll over a minute apart could
+        then trade places forever.
+        """
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com"); h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com"); h.make_live("a@example.com", 1)
+        a = self._at(h, 600)
+        b = self._at(h, 660)  # 60s apart — inside RECOVERY_HYSTERESIS_S
+        outcome = h.tick_with_usage({
+            "1": _usage(99, a), "2": _usage(98, b), "3": _usage(100, a),
+        })
+        assert outcome is TickOutcome.BLOCKED, (
+            "consume-first skipped the recovery hysteresis"
+        )
+        assert h.active_number() == 1
