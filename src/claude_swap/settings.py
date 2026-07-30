@@ -445,18 +445,32 @@ def atomic_write_json(path: Path, data: dict) -> None:
 
     Shared by settings.json and the autoswitch state file (and any future
     machine-local state files beside them).
+
+    **Writes THROUGH a symlink, never over it.** A rename swaps a directory
+    ENTRY and does not follow links, so renaming onto a symlinked path
+    DETACHES the link: the write succeeds, the content is right, and the
+    link target silently stops receiving updates. Where these files are
+    dotfiles-managed (a link into a config repo), the next deploy restores
+    the tracked copy and every change written since the detach is gone —
+    measured in the field as a settings section that vanished while the
+    state it configured stayed live. Same shape as #192/#193, which fixed
+    ``session.py``'s own writer; this is the shared writer behind eight
+    call sites. A DANGLING link still writes where it points (that is what
+    linking it asked for), and the temp file is created beside the
+    RESOLVED path so the rename stays same-filesystem and atomic.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    target = Path(os.path.realpath(path)) if path.is_symlink() else path
+    target.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":
-        os.chmod(path.parent, 0o700)
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        os.chmod(target.parent, 0o700)
+    fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
     try:
         os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
         os.close(fd)
         fd = -1
-        replace_with_retry(tmp_path, str(path))
+        replace_with_retry(tmp_path, str(target))
         if sys.platform != "win32":
-            os.chmod(str(path), 0o600)
+            os.chmod(str(target), 0o600)
     except BaseException:
         if fd >= 0:
             os.close(fd)

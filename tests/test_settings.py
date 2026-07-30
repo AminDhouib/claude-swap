@@ -279,3 +279,48 @@ class TestMergedWithCli:
     def test_strategy_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="consume-first"))
         assert merged.strategy == "consume-first"
+
+
+class TestAtomicWriteThroughSymlink:
+    """A rename swaps a directory ENTRY and does not follow links, so a
+    rename onto a symlinked path DETACHES it: the write lands, the target
+    stops updating, and the next dotfiles deploy restores the tracked copy
+    — losing every change since (measured: a settings section that vanished
+    while the state it configured stayed live). Same shape as #192/#193,
+    which fixed session.py only; this is the shared writer behind 8 call
+    sites."""
+
+    def test_write_preserves_the_link_and_updates_the_target(self, tmp_path):
+        import json
+        from claude_swap.settings import atomic_write_json
+        repo = tmp_path / "repo"; repo.mkdir()
+        live = tmp_path / "live"; live.mkdir()
+        tracked = repo / "settings.json"
+        tracked.write_text(json.dumps({"tracked": True}))
+        link = live / "settings.json"
+        link.symlink_to(tracked)
+
+        atomic_write_json(link, {"written": "through"})
+
+        assert link.is_symlink(), "the dotfiles link must survive the write"
+        assert json.loads(tracked.read_text()) == {"written": "through"}
+
+    def test_dangling_link_writes_where_it_points(self, tmp_path):
+        import json
+        from claude_swap.settings import atomic_write_json
+        target = tmp_path / "gone" / "settings.json"
+        link = tmp_path / "settings.json"
+        link.symlink_to(target)
+
+        atomic_write_json(link, {"dangling": "ok"})
+
+        assert link.is_symlink()
+        assert json.loads(target.read_text()) == {"dangling": "ok"}
+
+    def test_plain_file_write_unchanged(self, tmp_path):
+        import json
+        from claude_swap.settings import atomic_write_json
+        p = tmp_path / "settings.json"
+        atomic_write_json(p, {"plain": 1})
+        assert not p.is_symlink()
+        assert json.loads(p.read_text()) == {"plain": 1}
