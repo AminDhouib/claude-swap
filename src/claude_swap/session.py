@@ -43,15 +43,19 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import proper_lockfile
-from claude_swap.exceptions import ClaudeCodeLockTimeout, SessionError
+from claude_swap.exceptions import (
+    ClaudeCodeLockTimeout,
+    CredentialReadError,
+    SessionError,
+)
 from claude_swap.fsutil import replace_with_retry
-from claude_swap.macos_keychain import KeychainError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.oauth import refresh_oauth_credentials
@@ -198,7 +202,7 @@ def delete_macos_keychain_entry(session_dir: Path) -> None:
         macos_keychain.delete_password(
             keychain_service_name(session_dir), _keychain_account_name()
         )
-    except KeychainError:
+    except macos_keychain.KEYCHAIN_ERRORS:
         pass  # best-effort; absent entry is already success (rc 44)
 
 
@@ -218,7 +222,13 @@ def read_session_credentials(session_dir: Path) -> str | None:
     return read_config_dir_credentials(str(session_dir))
 
 
-def read_config_dir_credentials(config_dir: str) -> str | None:
+# Bounded retry for the strict capture read, mirroring the active store's
+# (credentials._ACTIVE_READ_ATTEMPTS / _ACTIVE_READ_RETRY_DELAY).
+_STRICT_KEYCHAIN_ATTEMPTS = 2
+_STRICT_KEYCHAIN_RETRY_DELAY = 0.3  # seconds between attempts
+
+
+def read_config_dir_credentials(config_dir: str, *, strict_keychain: bool = False) -> str | None:
     """Same read for an arbitrary ``CLAUDE_CONFIG_DIR`` value.
 
     Takes the raw string rather than a ``Path``: claude derives the keychain
@@ -226,19 +236,38 @@ def read_config_dir_credentials(config_dir: str) -> str | None:
     which drops a trailing slash or a leading ``./`` — would look up a service
     name claude never wrote and fall back to the (possibly stale) plaintext
     seed instead.
+
+    ``strict_keychain`` is for capture (``add``): an *unreadable* keychain —
+    locked, denied, timed out — retries once and then raises
+    :class:`CredentialReadError` instead of falling back to the plaintext seed.
+    The seed may predate an in-profile ``/login``, and capturing it would file
+    one account's email against another's token — the very mismatch the capture
+    path exists to prevent. An *absent* entry (rc 44) still falls back either
+    way: absence is claude's own signal to read the file.
     """
     directory = Path(config_dir)
     if not directory.is_dir():
         return None
     if Platform.detect() == Platform.MACOS:
-        try:
-            creds = macos_keychain.get_password(
-                keychain_service_name(config_dir), _keychain_account_name()
-            )
+        attempts = _STRICT_KEYCHAIN_ATTEMPTS if strict_keychain else 1
+        for attempt in range(attempts):
+            try:
+                creds = macos_keychain.get_password(
+                    keychain_service_name(config_dir), _keychain_account_name()
+                )
+            except macos_keychain.KEYCHAIN_ERRORS as e:
+                if attempt + 1 < attempts:
+                    time.sleep(_STRICT_KEYCHAIN_RETRY_DELAY)
+                    continue
+                if strict_keychain:
+                    raise CredentialReadError(
+                        f"Keychain entry for profile {config_dir} is unreadable "
+                        f"(locked or busy) — unlock the keychain and retry: {e}"
+                    ) from e
+                break  # best-effort read: the plaintext seed is the next-best truth
             if creds:
                 return creds
-        except KeychainError:
-            pass  # locked/denied/timeout — the plaintext seed is the next-best truth
+            break  # entry absent (rc 44) — claude's own signal to read the file
     try:
         return (directory / ".credentials.json").read_text(encoding="utf-8")
     except (OSError, ValueError):

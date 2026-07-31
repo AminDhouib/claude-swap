@@ -1874,3 +1874,76 @@ class TestCaptureCredentials:
         switcher.add_account()
 
         assert ACTIVE_TOKEN in self._stored(switcher)
+
+    @pytest.mark.parametrize(
+        "error",
+        [macos_keychain.KeychainError("keychain is locked"), OSError("no security binary")],
+        ids=["keychain-error", "os-error"],
+    )
+    def test_unreadable_keychain_fails_closed(
+        self, error, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """A locked/denied keychain must not silently capture the plaintext
+        seed — it may predate an in-profile ``/login`` and belong to another
+        account. One bounded retry, then the add fails. Covers the wrapper's
+        whole ``KEYCHAIN_ERRORS`` contract, not just ``KeychainError``."""
+        switcher = self._switcher(Platform.MACOS, monkeypatch)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path)))
+        monkeypatch.setattr(session_mod, "_STRICT_KEYCHAIN_RETRY_DELAY", 0)
+        calls: list[str] = []
+        fake_store_read = macos_keychain.get_password
+
+        def locked(service: str, account: str) -> str | None:
+            if not service.startswith("Claude Code-credentials-"):
+                return fake_store_read(service, account)  # cswap's own backup store
+            calls.append(service)
+            raise error
+
+        monkeypatch.setattr(macos_keychain, "get_password", locked)
+
+        with pytest.raises(CredentialReadError, match="unreadable"):
+            switcher.add_account()
+
+        assert len(calls) == session_mod._STRICT_KEYCHAIN_ATTEMPTS
+        assert "1" not in switcher._get_sequence_data().get("accounts", {})
+
+    def test_transient_keychain_error_retries(
+        self, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        switcher = self._switcher(Platform.MACOS, monkeypatch)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path)))
+        monkeypatch.setattr(session_mod, "_STRICT_KEYCHAIN_RETRY_DELAY", 0)
+        outcomes = iter(["busy", json.dumps({"claudeAiOauth": {"accessToken": "rotated"}})])
+        fake_store_read = macos_keychain.get_password
+
+        def flaky(service: str, account: str) -> str | None:
+            if not service.startswith("Claude Code-credentials-"):
+                return fake_store_read(service, account)  # cswap's own backup store
+            outcome = next(outcomes)
+            if outcome == "busy":
+                raise macos_keychain.KeychainError("busy")
+            return outcome
+
+        monkeypatch.setattr(macos_keychain, "get_password", flaky)
+
+        switcher.add_account()
+
+        assert "rotated" in self._stored(switcher)
+
+    def test_session_read_still_falls_back_on_keychain_error(
+        self, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """``read_session_credentials`` stays best-effort: the sync paths
+        prefer a possibly-stale seed over aborting a listing on a locked
+        keychain. Only capture is strict."""
+        monkeypatch.setattr(Platform, "detect", classmethod(lambda cls: Platform.MACOS))
+        session_dir = self._config_dir(tmp_path)
+
+        def locked(service: str, account: str) -> str | None:
+            raise macos_keychain.KeychainError("keychain is locked")
+
+        monkeypatch.setattr(macos_keychain, "get_password", locked)
+
+        creds = session_mod.read_session_credentials(session_dir)
+
+        assert creds is not None and CONFIG_DIR_TOKEN in creds

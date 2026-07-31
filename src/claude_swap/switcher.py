@@ -495,6 +495,11 @@ class ClaudeAccountSwitcher:
         A managed API key sits outside any OAuth store, and
         :meth:`_reject_live_api_key_capture` still has to answer for one.
 
+        Strict on the keychain: an unreadable (not absent) entry raises
+        :class:`CredentialReadError` rather than silently capturing the
+        profile's possibly-stale plaintext seed — and rather than reaching the
+        fallbacks below, which belong to other stores entirely.
+
         Read-only. cswap does not write claude's hashed keychain entry — see
         the ``session`` module docstring for why.
         """
@@ -504,7 +509,7 @@ class ClaudeAccountSwitcher:
 
         from claude_swap.session import read_config_dir_credentials
 
-        creds = read_config_dir_credentials(config_dir)
+        creds = read_config_dir_credentials(config_dir, strict_keychain=True)
         if creds:
             return creds
         if _same_directory(Path(config_dir), get_default_claude_config_home()):
