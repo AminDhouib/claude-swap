@@ -1905,7 +1905,7 @@ class TestCaptureCredentials:
             switcher.add_account()
 
         assert len(calls) == session_mod._STRICT_KEYCHAIN_ATTEMPTS
-        assert "1" not in switcher._get_sequence_data().get("accounts", {})
+        assert "1" not in (switcher._get_sequence_data() or {}).get("accounts", {})
 
     def test_transient_keychain_error_retries(
         self, temp_home: Path, tmp_path: Path, monkeypatch
@@ -1947,3 +1947,119 @@ class TestCaptureCredentials:
         creds = session_mod.read_session_credentials(session_dir)
 
         assert creds is not None and CONFIG_DIR_TOKEN in creds
+
+    @staticmethod
+    def _secure_dir(base: Path, token: str = "secure-store-token") -> Path:
+        """A bare secure-storage dir: credentials only, no identity — claude's
+        ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` moves secure storage, not config."""
+        directory = base / "securestore"
+        directory.mkdir()
+        (directory / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": token}}), encoding="utf-8"
+        )
+        return directory
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_securestorage_dir_overrides_config_dir(
+        self, platform, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """Claude sources secure storage from ``CLAUDE_SECURESTORAGE_CONFIG_DIR``
+        when it is defined, ``CLAUDE_CONFIG_DIR`` otherwise; identity stays on
+        ``CLAUDE_CONFIG_DIR``."""
+        switcher = self._switcher(platform, monkeypatch)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path)))
+        monkeypatch.setenv(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR", str(self._secure_dir(tmp_path))
+        )
+
+        switcher.add_account()
+
+        assert "secure-store-token" in self._stored(switcher)
+        assert CONFIG_DIR_TOKEN not in self._stored(switcher)
+
+    def test_securestorage_hashed_keychain_entry(
+        self, temp_home: Path, tmp_path: Path, block_real_keychain, monkeypatch
+    ):
+        """The hashed keychain service name derives from the securestorage
+        value when defined, not from ``CLAUDE_CONFIG_DIR``."""
+        switcher = self._switcher(Platform.MACOS, monkeypatch)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path)))
+        secure = self._secure_dir(tmp_path)
+        block_real_keychain.set_password(
+            keychain_service_name(str(secure)),
+            session_mod._keychain_account_name(),
+            json.dumps({"claudeAiOauth": {"accessToken": "rotated"}}),
+        )
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(secure))
+
+        switcher.add_account()
+
+        assert "rotated" in self._stored(switcher)
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_empty_securestorage_dir_forces_default_store(
+        self, platform, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """Defined-but-empty is claude's "force the default secure store":
+        unsuffixed keychain item and ``~/.claude/.credentials.json`` — even
+        though ``CLAUDE_CONFIG_DIR`` names a profile with its own seed."""
+        switcher = self._switcher(platform, monkeypatch)
+        switcher._write_credentials(ACTIVE_CREDS)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path)))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+
+        switcher.add_account()
+
+        assert ACTIVE_TOKEN in self._stored(switcher)
+        assert CONFIG_DIR_TOKEN not in self._stored(switcher)
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_securestorage_without_config_dir(
+        self, platform, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """Securestorage alone moves only the credential read; identity still
+        resolves through the (default) config profile."""
+        switcher = self._switcher(platform, monkeypatch)
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        get_global_config_path().write_text(CONFIG_DIR_CONFIG, encoding="utf-8")
+        monkeypatch.setenv(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR", str(self._secure_dir(tmp_path))
+        )
+
+        switcher.add_account()
+
+        assert "secure-store-token" in self._stored(switcher)
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_empty_selected_store_does_not_leak_config_profile(
+        self, platform, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """Defined-but-empty selects the default store; when that store is
+        credentialless, claude sees a logged-out environment — the config
+        profile's seed must not answer in its place."""
+        switcher = self._switcher(platform, monkeypatch)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path)))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+
+        with pytest.raises(CredentialReadError):
+            switcher.add_account()
+
+        assert "1" not in (switcher._get_sequence_data() or {}).get("accounts", {})
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_credentialless_securestorage_default_dir_does_not_fall_back(
+        self, platform, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """A non-empty override naming ``~/.claude`` uses the *hashed* service
+        name (claude keys the suffix off env presence, not the path), so
+        neither the unsuffixed item nor the config profile's seed may answer."""
+        switcher = self._switcher(platform, monkeypatch)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path)))
+        monkeypatch.setenv(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR", str(Path.home() / ".claude")
+        )
+
+        with pytest.raises(CredentialReadError):
+            switcher.add_account()
+
+        assert "1" not in (switcher._get_sequence_data() or {}).get("accounts", {})
