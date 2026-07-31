@@ -477,7 +477,7 @@ class ClaudeAccountSwitcher:
         return self._store._read_active_credentials()
 
     def _read_capture_credentials(self) -> str | None:
-        """Read the credential of the profile ``CLAUDE_CONFIG_DIR`` points at.
+        """Read the credential of the profile the environment points at.
 
         ``add_account`` fills one slot from two reads: the identity out of
         ``.claude.json`` and the credential out of the active store. The active
@@ -489,6 +489,14 @@ class ClaudeAccountSwitcher:
 
         Read the OAuth credential the way claude resolves it for the same
         environment, so the slot's email and token come from one profile.
+        Claude (2.1.220 ``getMacOsKeychainStorageServiceName``/storage-path
+        resolution) sources secure storage from ``CLAUDE_SECURESTORAGE_CONFIG_DIR``
+        when that is *defined*, else ``CLAUDE_CONFIG_DIR`` — with defined-but-empty
+        meaning the *default secure store* (unsuffixed Keychain item,
+        ``~/.claude/.credentials.json``). Not the active store: its file backend
+        follows ``CLAUDE_CONFIG_DIR``, which may point elsewhere. Identity stays
+        on ``CLAUDE_CONFIG_DIR`` either way; only the credential read moves.
+
         Two fallbacks stay inside that profile. An env var naming the default
         profile means the active store, since a user exporting
         ``CLAUDE_CONFIG_DIR=~/.claude`` may only have the unsuffixed item.
@@ -503,17 +511,36 @@ class ClaudeAccountSwitcher:
         Read-only. cswap does not write claude's hashed keychain entry — see
         the ``session`` module docstring for why.
         """
-        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-        if not config_dir:
-            return self._read_credentials()
-
         from claude_swap.session import read_config_dir_credentials
 
-        creds = read_config_dir_credentials(config_dir, strict_keychain=True)
-        if creds:
-            return creds
-        if _same_directory(Path(config_dir), get_default_claude_config_home()):
+        secure_env = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+
+        if secure_env is not None:
+            # A defined override names the *only* store claude will read for
+            # this environment — defined-but-empty pins the default profile
+            # (unsuffixed keychain item, ``~/.claude/.credentials.json``). On
+            # a miss claude sees a logged-out environment, so no falling back
+            # into the active store: its file backend follows
+            # ``CLAUDE_CONFIG_DIR``, and with the two vars diverged that would
+            # capture a profile claude is not reading (cross-profile leak).
+            creds = read_config_dir_credentials(
+                secure_env or str(get_default_claude_config_home()),
+                strict_keychain=True,
+                keychain_service=CLAUDE_CODE_KEYCHAIN_SERVICE if not secure_env else None,
+            )
+            if creds:
+                return creds
+        elif not config_dir:
             return self._read_credentials()
+        else:
+            creds = read_config_dir_credentials(config_dir, strict_keychain=True)
+            if creds:
+                return creds
+            if _same_directory(Path(config_dir), get_default_claude_config_home()):
+                # Safe only on this legacy path: the active store's env-following
+                # file backend and the default profile coincide here.
+                return self._read_credentials()
         # Only this profile's own ``primaryApiKey`` — never the unsuffixed
         # "Claude Code" Keychain item, which belongs to the default profile
         # and would answer for a login that is not the one being added.

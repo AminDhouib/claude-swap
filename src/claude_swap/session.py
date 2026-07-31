@@ -228,7 +228,12 @@ _STRICT_KEYCHAIN_ATTEMPTS = 2
 _STRICT_KEYCHAIN_RETRY_DELAY = 0.3  # seconds between attempts
 
 
-def read_config_dir_credentials(config_dir: str, *, strict_keychain: bool = False) -> str | None:
+def read_config_dir_credentials(
+    config_dir: str,
+    *,
+    strict_keychain: bool = False,
+    keychain_service: str | None = None,
+) -> str | None:
     """Same read for an arbitrary ``CLAUDE_CONFIG_DIR`` value.
 
     Takes the raw string rather than a ``Path``: claude derives the keychain
@@ -236,6 +241,10 @@ def read_config_dir_credentials(config_dir: str, *, strict_keychain: bool = Fals
     which drops a trailing slash or a leading ``./`` — would look up a service
     name claude never wrote and fall back to the (possibly stale) plaintext
     seed instead.
+
+    ``keychain_service`` overrides the derived hashed name for the one profile
+    whose item is *unsuffixed*: the default profile, which claude selects with
+    ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` defined-but-empty.
 
     ``strict_keychain`` is for capture (``add``): an *unreadable* keychain —
     locked, denied, timed out — retries once and then raises
@@ -253,7 +262,8 @@ def read_config_dir_credentials(config_dir: str, *, strict_keychain: bool = Fals
         for attempt in range(attempts):
             try:
                 creds = macos_keychain.get_password(
-                    keychain_service_name(config_dir), _keychain_account_name()
+                    keychain_service or keychain_service_name(config_dir),
+                    _keychain_account_name(),
                 )
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 if attempt + 1 < attempts:
