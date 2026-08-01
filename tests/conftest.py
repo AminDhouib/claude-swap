@@ -298,15 +298,10 @@ def _deterministic_colour(monkeypatch):
     '\\x1b[38;5;173mSkipping\\x1b[0m Account-2 (disabled)'``, and the same
     tree green with the variable unset.
 
-    ``printer._colors_enabled`` is reset too. It is a module global cached on
-    the first styled call, and it is FILLED for most of a session — measured
-    across a full run, non-None for 1599 of 1697 tests. So the scrub only
-    decides its value for whichever test first triggers ``colors_enabled()``;
-    after that everything rides the cached verdict. Without the reset, one
-    test latching it True defeats the scrub for every test that follows, on a
-    machine where neither variable was ever exported. Measured: a probe test
-    in another file setting it True, clean env, no reset -> the same 11
-    test_switcher failures; with the reset -> green.
+    ``printer._colors_enabled`` is reset too: it is filled for most of a
+    session (measured non-None for 1599 of 1697 tests), so the scrub decides
+    the verdict only once and one test latching it True would colour every
+    test after.
 
     Tests that exercise the detection itself set the variables explicitly,
     which overrides this.

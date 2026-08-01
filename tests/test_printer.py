@@ -214,15 +214,10 @@ class TestForceUtf8Output:
 class TestColourEnvDoesNotLeakIntoTests:
     """A developer's terminal must not decide whether the suite passes.
 
-    ``_detect_color_support`` honours ``FORCE_COLOR``/``NO_COLOR`` BEFORE it
-    checks ``isatty()`` — correct for the CLI, where the variables exist to
-    override detection, and wrong under pytest, where stdout is captured.
-    Measured with ``FORCE_COLOR=3`` exported: 11 failures in test_switcher.py,
-    green in the same tree with it unset.
-
-    These assert on OUTPUT. A test checking only ``"FORCE_COLOR" not in
-    os.environ`` passes for free on any box that never exported it — most
-    boxes, every CI runner — so it would not have caught this.
+    See ``_deterministic_colour`` in conftest for the measurement. These
+    assert on OUTPUT: checking only ``"FORCE_COLOR" not in os.environ``
+    passes for free on any box that never exported it, which is most
+    boxes and every CI runner.
     """
 
     def test_styled_output_is_plain(self):
@@ -234,7 +229,7 @@ class TestColourEnvDoesNotLeakIntoTests:
         assert printer.accent("Skipping") == "Skipping"
         assert "\x1b[" not in printer.muted("usage")
 
-    def test_detection_reaches_isatty_rather_than_an_override(self):
+    def test_detection_reaches_isatty_rather_than_an_override(self, monkeypatch):
         """Guards the NO_COLOR scrub, which the test above cannot see.
 
         Both scrubs land on the same OUTPUT — plain — so a fixture that
@@ -245,35 +240,16 @@ class TestColourEnvDoesNotLeakIntoTests:
         ``isatty()`` check, so forcing that to report a TTY must flip it.
         A surviving NO_COLOR would pin it False regardless.
         """
-        import sys
-
-        class _Tty:
-            def isatty(self):
-                return True
-
-            def __getattr__(self, name):
-                return getattr(sys.__stdout__, name)
-
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
         printer._colors_enabled = None
-        real, sys.stdout = sys.stdout, _Tty()
-        try:
-            assert printer.colors_enabled() is True
-        finally:
-            sys.stdout = real
-            printer._colors_enabled = None
+        assert printer.colors_enabled() is True
 
     def test_the_fixture_resets_the_cache_it_inherits(self):
         """Clearing the variables is not enough on its own.
 
-        ``_colors_enabled`` is filled on the first styled call and is non-None
-        for most of a session (measured: 1599 of 1697 tests), so the scrub
-        only decides the verdict once — everything after rides the cached
-        answer. One test latching it True would otherwise colour every test
-        that follows, on a machine where neither variable was ever exported.
-
-        Asserted on the state the fixture LEFT, not on one this test sets:
-        a test that latches the cache itself is testing its own line, since
-        the fixture has already run by then. What must hold is that whatever
-        the previous test left behind does not survive into this one.
+        ``_colors_enabled`` is non-None for most of a session, so the scrub
+        decides the verdict once and everything after rides it. Asserts on
+        the state the fixture LEFT: a test that latches the cache itself
+        would only be testing its own line.
         """
         assert printer._colors_enabled is None
