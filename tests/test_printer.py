@@ -209,3 +209,42 @@ class TestForceUtf8Output:
         monkeypatch.setattr(sys, "stdout", StringIO())
         monkeypatch.setattr(sys, "stderr", StringIO())
         printer.force_utf8_output()  # must not raise
+
+
+
+class TestColourEnvDoesNotLeakIntoTests:
+    """A developer's terminal must not decide whether the suite passes.
+
+    ``_detect_color_support`` honours ``FORCE_COLOR``/``NO_COLOR`` BEFORE it
+    checks ``isatty()``. That is correct for the CLI — those variables exist
+    to override detection — and wrong under pytest, where stdout is captured
+    and colour should therefore be off. Measured on a developer box with
+    ``FORCE_COLOR=3`` exported: 11 failures in test_switcher.py, all of the
+    shape ``assert 'Skipping Account-2 (disabled)' in
+    '\\x1b[38;5;173mSkipping\\x1b[0m Account-2 (disabled)'``, and the same
+    tree green with the variable unset. The tests were right and the code was
+    right; the environment decided.
+
+    These assert on what a test SEES, not on the variables — a test that only
+    checked ``"FORCE_COLOR" not in os.environ`` would pass for free on a box
+    that never exported it, which is most boxes, and would not have caught
+    this.
+    """
+
+    def test_no_colour_env_reaches_a_test(self):
+        """Neither override is visible, whatever the developer exported."""
+        import os
+
+        assert "FORCE_COLOR" not in os.environ
+        assert "NO_COLOR" not in os.environ
+
+    def test_styled_output_is_plain(self):
+        """The end state that matters: captured stdout gets no escape codes.
+
+        This is the assertion the 11 test_switcher failures were really
+        making, reduced to one line and moved next to its cause.
+        """
+        from claude_swap import printer
+
+        assert printer.accent("Skipping") == "Skipping"
+        assert "\x1b[" not in printer.muted("usage")

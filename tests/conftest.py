@@ -283,3 +283,29 @@ def _deterministic_poll_jitter(monkeypatch):
     """Zero the poll-plan jitter so cadence tests are clock-exact; the jitter
     itself is exercised in test_poll_policy via an injected rng."""
     monkeypatch.setattr("claude_swap.poll_policy.JITTER_FRAC", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_colour(monkeypatch):
+    """A developer's terminal must not decide whether the suite passes.
+
+    ``printer._detect_color_support`` honours ``FORCE_COLOR``/``NO_COLOR``
+    before it consults ``isatty()`` — correct for the CLI, where those
+    variables exist to override detection, and wrong under pytest, where
+    stdout is captured and every assertion on plain output then breaks.
+    Measured with ``FORCE_COLOR=3`` exported: 11 failures in test_switcher.py
+    reading ``assert 'Skipping Account-2 (disabled)' in
+    '\\x1b[38;5;173mSkipping\\x1b[0m Account-2 (disabled)'``, and the same
+    tree green with the variable unset.
+
+    Only the variables are scrubbed. ``printer._colors_enabled`` is a module
+    global cached on first use, so resetting it here looks prudent — but
+    nothing styles output at import or collection time, so it is still None
+    when this runs, and a mutation run with the reset removed left the whole
+    suite green. Unfalsifiable defence, left out.
+
+    Tests that exercise the detection itself set the variables explicitly,
+    which overrides this.
+    """
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
