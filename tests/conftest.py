@@ -299,7 +299,7 @@ def _deterministic_colour(monkeypatch):
     tree green with the variable unset.
 
     ``printer._colors_enabled`` is reset too: it is filled for most of a
-    session (measured non-None for 1599 of 1697 tests), so the scrub decides
+    session (measured non-None for 1599 of 1698 tests), so the scrub decides
     the verdict only once and one test latching it True would colour every
     test after.
 

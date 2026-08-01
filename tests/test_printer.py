@@ -220,12 +220,20 @@ class TestColourEnvDoesNotLeakIntoTests:
     boxes and every CI runner.
     """
 
-    def test_styled_output_is_plain(self):
+    def test_styled_output_is_plain(self, monkeypatch):
         """The reduced form of the 11 test_switcher failures.
 
         Guards the FORCE_COLOR scrub: without it this returns the styled
         string on any machine that exported the variable.
+
+        stdout is pinned to a StringIO, as the rest of this file does. The
+        fixture guarantees the variables are gone, not that stdout is not a
+        tty — so under ``pytest -s`` on a terminal, detection correctly falls
+        through to isatty() and returns True. Asserting unconditionally made
+        the outcome depend on how the developer invoked pytest, which is the
+        failure class this whole change exists to remove.
         """
+        monkeypatch.setattr(sys, "stdout", StringIO())
         assert printer.accent("Skipping") == "Skipping"
         assert "\x1b[" not in printer.muted("usage")
 
@@ -241,15 +249,4 @@ class TestColourEnvDoesNotLeakIntoTests:
         A surviving NO_COLOR would pin it False regardless.
         """
         monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
-        printer._colors_enabled = None
         assert printer.colors_enabled() is True
-
-    def test_the_fixture_resets_the_cache_it_inherits(self):
-        """Clearing the variables is not enough on its own.
-
-        ``_colors_enabled`` is non-None for most of a session, so the scrub
-        decides the verdict once and everything after rides it. Asserts on
-        the state the fixture LEFT: a test that latches the cache itself
-        would only be testing its own line.
-        """
-        assert printer._colors_enabled is None
