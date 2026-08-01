@@ -211,40 +211,69 @@ class TestForceUtf8Output:
         printer.force_utf8_output()  # must not raise
 
 
-
 class TestColourEnvDoesNotLeakIntoTests:
     """A developer's terminal must not decide whether the suite passes.
 
     ``_detect_color_support`` honours ``FORCE_COLOR``/``NO_COLOR`` BEFORE it
-    checks ``isatty()``. That is correct for the CLI — those variables exist
-    to override detection — and wrong under pytest, where stdout is captured
-    and colour should therefore be off. Measured on a developer box with
-    ``FORCE_COLOR=3`` exported: 11 failures in test_switcher.py, all of the
-    shape ``assert 'Skipping Account-2 (disabled)' in
-    '\\x1b[38;5;173mSkipping\\x1b[0m Account-2 (disabled)'``, and the same
-    tree green with the variable unset. The tests were right and the code was
-    right; the environment decided.
+    checks ``isatty()`` — correct for the CLI, where the variables exist to
+    override detection, and wrong under pytest, where stdout is captured.
+    Measured with ``FORCE_COLOR=3`` exported: 11 failures in test_switcher.py,
+    green in the same tree with it unset.
 
-    These assert on what a test SEES, not on the variables — a test that only
-    checked ``"FORCE_COLOR" not in os.environ`` would pass for free on a box
-    that never exported it, which is most boxes, and would not have caught
-    this.
+    These assert on OUTPUT. A test checking only ``"FORCE_COLOR" not in
+    os.environ`` passes for free on any box that never exported it — most
+    boxes, every CI runner — so it would not have caught this.
     """
 
-    def test_no_colour_env_reaches_a_test(self):
-        """Neither override is visible, whatever the developer exported."""
-        import os
-
-        assert "FORCE_COLOR" not in os.environ
-        assert "NO_COLOR" not in os.environ
-
     def test_styled_output_is_plain(self):
-        """The end state that matters: captured stdout gets no escape codes.
+        """The reduced form of the 11 test_switcher failures.
 
-        This is the assertion the 11 test_switcher failures were really
-        making, reduced to one line and moved next to its cause.
+        Guards the FORCE_COLOR scrub: without it this returns the styled
+        string on any machine that exported the variable.
         """
-        from claude_swap import printer
-
         assert printer.accent("Skipping") == "Skipping"
         assert "\x1b[" not in printer.muted("usage")
+
+    def test_detection_reaches_isatty_rather_than_an_override(self):
+        """Guards the NO_COLOR scrub, which the test above cannot see.
+
+        Both scrubs land on the same OUTPUT — plain — so a fixture that
+        cleared only FORCE_COLOR would still pass the test above while
+        leaving NO_COLOR free to steer any suite asserting that styling IS
+        present. What separates them is WHY the answer is plain: with the
+        variables gone, detection has to fall through to the captured-stdout
+        ``isatty()`` check, so forcing that to report a TTY must flip it.
+        A surviving NO_COLOR would pin it False regardless.
+        """
+        import sys
+
+        class _Tty:
+            def isatty(self):
+                return True
+
+            def __getattr__(self, name):
+                return getattr(sys.__stdout__, name)
+
+        printer._colors_enabled = None
+        real, sys.stdout = sys.stdout, _Tty()
+        try:
+            assert printer.colors_enabled() is True
+        finally:
+            sys.stdout = real
+            printer._colors_enabled = None
+
+    def test_the_fixture_resets_the_cache_it_inherits(self):
+        """Clearing the variables is not enough on its own.
+
+        ``_colors_enabled`` is filled on the first styled call and is non-None
+        for most of a session (measured: 1599 of 1697 tests), so the scrub
+        only decides the verdict once — everything after rides the cached
+        answer. One test latching it True would otherwise colour every test
+        that follows, on a machine where neither variable was ever exported.
+
+        Asserted on the state the fixture LEFT, not on one this test sets:
+        a test that latches the cache itself is testing its own line, since
+        the fixture has already run by then. What must hold is that whatever
+        the previous test left behind does not survive into this one.
+        """
+        assert printer._colors_enabled is None
