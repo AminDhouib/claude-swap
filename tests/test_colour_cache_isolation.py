@@ -21,8 +21,8 @@ This lives in its own file deliberately. ``test_printer.py`` has a module-local
 tests, so a leak staged there is cleaned up by that fixture rather than by
 conftest's, and the guard would pass with the thing it guards removed.
 Falsified rather than assumed: staging the identical pair at the end of
-``test_printer.py`` and neutering conftest's reset leaves that file at 26
-passed and the whole suite at 1699 passed.
+``test_printer.py`` and neutering conftest's reset leaves that file and the
+whole suite green — the module-local fixture swallows the leak.
 
 pytest runs tests in definition order within a file, so the pair below is a
 real ordering: the first latches, the second reads.
@@ -34,9 +34,17 @@ neutered::
     pytest ...::test_the_next_test_is_not_styled_by_it      1 passed
 
 Selecting only the reader skips the latch, so it is green over a broken
-fixture. Inherent to any ordering guard and not worth merging the two — a
-single test that both latches and reads would have to reset the cache itself,
-which is the very thing under test. Noted so a green single-test run is not
+fixture — and so does ANY ordering that puts the reader first. Measured with
+the guard mutated, 30 random-order seeds: the cache pair escaped 10 times and
+the theme pair 15. Under `-n 4` the two land on different workers, hence
+different processes, and neither latch reaches its reader at all. Neither
+plugin is a dependency today, and the FULL-suite mutants still fail under both
+(the reader inherits a dirty global from the 90 test_usage_store tests), so
+only file-scoped runs go blind.
+
+Inherent to any ordering guard and not worth merging the two — a single test
+that both latches and reads would have to reset the global itself, which is
+the very thing under test. Noted so a green run of the guard file alone is not
 mistaken for evidence.
 """
 
@@ -132,7 +140,6 @@ def test_the_suite_does_not_query_the_developers_terminal(monkeypatch):
     guard into a failing one.
     """
     import io
-    import os
     import pty
 
     from claude_swap import appearance

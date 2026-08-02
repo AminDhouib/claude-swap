@@ -325,9 +325,18 @@ def _deterministic_colour(monkeypatch):
     Measured three ways, same suite, probe as the FIRST statement of this
     fixture::
 
-        as shipped                                1699 None
-        same reset, plain assignment (no restore)  296 False / 1402 None /   1 True
-        reset removed entirely                    1186 False /  415 True /  98 None
+        as shipped                                1702 None
+        same reset, plain assignment (no restore)  296 False / 1403 None /   3 True
+        reset removed entirely                    1186 False /  418 True /  98 None
+
+    THE SHAPE IS THE POINT, NOT THE DIGITS. These have now been stale three
+    times running, every time for the same reason: the commit that changes the
+    guard file also changes the denominator, and the numbers get copied from
+    the run made before the tests were added. What must hold is
+    `shipped == all None` and `removed == mostly not-None`; the exact counts
+    move with the suite and are here as evidence of the mechanism, not as a
+    contract. Re-take them with a probe as the FIRST statement of this fixture
+    body when they matter, and do not trust a figure that does not reproduce.
 
     The middle row is the control that separates the two explanations: identical
     reset, only the restore dropped, and the cache is dirty on entry for 297
@@ -354,8 +363,10 @@ def _deterministic_colour(monkeypatch):
     # The OTHER latched global in the same module, closed on the same grounds.
     # `tui/app.py` calls `printer.set_theme("light")`, a plain assignment with
     # nothing restoring it, so the tests after it run with the light palette:
-    # measured 1582 dark / 118 light on entry, the 118 being test_usage_store
-    # (90), test_update_check (26) and test_tui (2). Green today only because
+    # measured 1581 dark / 121 light on entry, the 121 being test_usage_store
+    # (90), test_update_check (26), this guard file (2), test_tui (2) and
+    # test_config_cli (1) — the latch below leaks past its own reader, which is
+    # the same self-poisoning the row-3 note describes. Green today only because
     # none of them asserts a palette code — which is exactly what was true of
     # `_colors_enabled` until a developer exported FORCE_COLOR.
     monkeypatch.setattr("claude_swap.printer._theme", "dark")
@@ -374,10 +385,12 @@ def _deterministic_colour(monkeypatch):
     # not flipping results; it is the same class this fixture exists for, one
     # module over.
     #
-    # Measured under a pty with `-s`: 8 reaches before, 2 after. The 6 that
-    # remain are test_appearance.py's own, which set TERM themselves to exercise
-    # the detection — the documented override, and the ones that SHOULD get
-    # there. Only the accidental reaches are closed.
+    # Measured under a pty with `-s`, instrumenting `tty.setcbreak` itself:
+    # 2 reaches without the pin, 0 with it. (An earlier note said 8 and 2 —
+    # that counted gate-passes rather than termios entries, and on the parent
+    # tree.) The two are test_cli.py's forwarded --token-status and this file's
+    # own guard; test_appearance.py sets TERM itself and is the documented
+    # override.
     #
     # Pinned by test_the_suite_does_not_query_the_developers_terminal, which
     # opens a real pty so both isatty() calls are genuinely True and the TERM
