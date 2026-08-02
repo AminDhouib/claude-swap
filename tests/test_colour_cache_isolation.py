@@ -27,25 +27,34 @@ whole suite green — the module-local fixture swallows the leak.
 pytest runs tests in definition order within a file, so the pair below is a
 real ordering: the first latches, the second reads.
 
-THE PAIR IS THE GUARD; EITHER ALONE PROVES NOTHING. Measured with the reset
-neutered::
+THE PAIR IS THE GUARD; EITHER ALONE PROVES NOTHING, AND THE ORDERING IT NEEDS
+IS NOT GUARANTEED. Measured with the reset neutered::
 
     pytest tests/test_colour_cache_isolation.py            1 failed, 1 passed
     pytest ...::test_the_next_test_is_not_styled_by_it      1 passed
 
 Selecting only the reader skips the latch, so it is green over a broken
 fixture — and so does ANY ordering that puts the reader first. Measured with
-the guard mutated, 30 random-order seeds: the cache pair escaped 10 times and
-the theme pair 15. Under `-n 4` the two land on different workers, hence
-different processes, and neither latch reaches its reader at all. Neither
-plugin is a dependency today, and the FULL-suite mutants still fail under both
-(the reader inherits a dirty global from the 90 test_usage_store tests), so
-only file-scoped runs go blind.
+the guard mutated by line number (landing asserted), seeds named so the figure
+is re-takeable::
 
-Inherent to any ordering guard and not worth merging the two — a single test
-that both latches and reads would have to reset the global itself, which is
-the very thing under test. Noted so a green run of the guard file alone is not
-mistaken for evidence.
+    file-scoped, seeds 1-30   cache escaped  6 (4 5 12 13 24 25)
+                              theme escaped 17 (1 2 7 8 9 11 12 14 16 17 18
+                                                19 20 21 23 26 28)
+    full suite, -p randomly   cache: seeds 4 and 5 -> 1702 passed, 3 skipped
+                              theme: seeds 1 and 2 -> 1702 passed, 3 skipped
+    file-scoped, -n 4         both mutants -> 5 passed
+
+So the escape is NOT bounded to file-scoped runs, which an earlier version of
+this paragraph claimed. Under `-n 4` the two land on different workers, hence
+different processes, and neither latch reaches its reader at all.
+
+What closes the hole is the post-condition in `conftest._deterministic_colour`,
+which asserts both globals are unlatched on entry to EVERY test — no ordering
+required. Same mutants, same seeds: 1694 and 1684 errors. This pair stays as
+the readable narrative of what the leak looks like; it is not what makes the
+suite safe. Merging the two into one test would not help either — it would
+have to reset the global itself, which is the thing under test.
 """
 
 from __future__ import annotations

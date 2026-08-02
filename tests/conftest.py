@@ -333,19 +333,34 @@ def _deterministic_colour(monkeypatch):
     times running, every time for the same reason: the commit that changes the
     guard file also changes the denominator, and the numbers get copied from
     the run made before the tests were added. What must hold is
-    `shipped == all None` and `removed == mostly not-None`; the exact counts
-    move with the suite and are here as evidence of the mechanism, not as a
-    contract. Re-take them with a probe as the FIRST statement of this fixture
-    body when they matter, and do not trust a figure that does not reproduce.
+    `shipped == all None` — the VALUE, not merely "not latched" — and
+    `removed == mostly not-None`; the exact counts move with the suite and are
+    here as evidence of the mechanism, not as a contract. Re-take them with a
+    probe as the FIRST statement of this fixture body when they matter, and do
+    not trust a figure that does not reproduce.
+
+    The value matters because a wrong one satisfies the shape. Measured:
+    pinning `False` instead of `None` leaves 1702 passed and a probe reading
+    `1702 None`, identical to shipped — and then both `delenv` lines can be
+    deleted and the suite stays green on a clean box. The reset has stopped
+    un-latching and started PINNING, a different mechanism with the same
+    signature. (The `True` direction is caught: 12 failures.) A large move in
+    row 3's `None` count is the other signal worth reading — adding a
+    module-local cache reset to one more test file takes it 98 -> 514, meaning
+    this reset now protects five times fewer tests, and only the digits say so.
 
     The middle row is the control that separates the two explanations: identical
     reset, only the restore dropped, and the cache is dirty on entry for 297
     tests. So the restore is the operative mechanism, not the probe's position.
 
-    The 415 ``True`` in the bottom row are this fixture's own guard file:
+    The bottom row's 418 ``True`` START at this fixture's own guard file:
     ``test_colour_cache_isolation.py`` latches the cache by plain assignment on
-    purpose, and with the reset gone nothing clears it until ``test_printer.py``
-    's module-local fixture fires 415 tests later. Row 3 poisons its own
+    purpose, and with the reset gone nothing clears it. They are spread across
+    the files that run after it — test_oauth (98), test_menubar (64),
+    test_json_output (38), test_migrations (29), test_poll_policy (29),
+    test_move_accounts (28), test_paths (27), test_config_cli (26) and a dozen
+    more — so the guard file starts the latch without accounting for the count,
+    and ``test_printer.py`` is not where it ends. Row 3 poisons its own
     measurement, which is why it must be re-taken whenever that file changes.
 
     (Two earlier versions of this docstring were wrong. The first claimed
@@ -357,6 +372,20 @@ def _deterministic_colour(monkeypatch):
     Tests that exercise the detection itself set the variables explicitly,
     which overrides this.
     """
+    # Ordering-PROOF half of the guard. `test_colour_cache_isolation.py`'s
+    # latch/read pairs read as the guard, but they only fire in one ordering:
+    # measured with the reset mutated out, the FULL suite is green on
+    # `-p randomly --randomly-seed=4` and `=5` (1702 passed, mutation verified
+    # applied), and file-scoped it escapes 6 of seeds 1-30 for the cache and 17
+    # of 30 for the theme. This assertion runs before every test, so no
+    # ordering hides a latch: same mutants, same seeds, 1694 and 1684 errors.
+    # Costs nothing today (1702 passed, 3 skipped with the fixture intact).
+    from claude_swap import printer as _printer
+
+    assert _printer._colors_enabled is None, (
+        "a previous test latched the colour cache and nothing reset it"
+    )
+    assert _printer._theme == "dark", "a previous test latched the theme"
     monkeypatch.delenv("FORCE_COLOR", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setattr("claude_swap.printer._colors_enabled", None)
@@ -365,7 +394,7 @@ def _deterministic_colour(monkeypatch):
     # nothing restoring it, so the tests after it run with the light palette:
     # measured 1581 dark / 121 light on entry, the 121 being test_usage_store
     # (90), test_update_check (26), this guard file (2), test_tui (2) and
-    # test_config_cli (1) — the latch below leaks past its own reader, which is
+    # test_config_cli (1) — the latch leaks past its own reader, which is
     # the same self-poisoning the row-3 note describes. Green today only because
     # none of them asserts a palette code — which is exactly what was true of
     # `_colors_enabled` until a developer exported FORCE_COLOR.
