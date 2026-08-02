@@ -298,20 +298,34 @@ def _deterministic_colour(monkeypatch):
     '\\x1b[38;5;173mSkipping\\x1b[0m Account-2 (disabled)'``, and the same
     tree green with the variable unset.
 
-    Deliberately does NOT reset ``printer._colors_enabled``. That line was
-    here, justified by "measured non-None for 1599 of 1698 tests" — and the
-    measurement does not hold: instrumenting this fixture reports the cache
-    ``None`` on entry for 1697 of 1697 tests. Nothing styles at import or
-    collection time, so the flag is still unset whenever the scrub runs, and
-    removing the reset leaves the suite identical under ``FORCE_COLOR=3``,
-    ``NO_COLOR=1`` and neither (1697 passed each way).
+    Scrubbing the variables is not enough on its own, because detection
+    CACHES. ``colors_enabled()`` latches the first answer into
+    ``printer._colors_enabled`` and every later call returns it, so one test
+    that latches ``True`` decides the styling for every test after it —
+    whatever the environment says by then. Under ``pytest -s`` stdout stays
+    the real terminal, ``isatty()`` is True, and the tests that latch are
+    ordinary ones nobody would suspect: ``test_migrations``, ``test_printer``,
+    ``test_swap_accounts``, ``test_transfer``, ``test_tui``. Measured on a pty
+    with no colour variable set at all::
 
-    An unfalsifiable guard is worse than none — it reads as protection while
-    proving nothing, which is exactly why this PR already excluded that same
-    reset from the production path. Applying the rule to our own line too.
+        pytest tests/test_migrations.py tests/test_switcher.py -q -s
+        11 failed, 382 passed
+
+    which is the same eleven assertions, in the same file, that motivated this
+    fixture. So the cache is reset too.
+
+    This line was briefly removed on the grounds that the cache is ``None`` on
+    entry for every test, i.e. that resetting it proves nothing. That
+    measurement was taken with the probe BELOW the reset, so it read back the
+    value the reset had just written. Probing at the top of the fixture gives
+    **1599 False, 98 None** — the 98 are the tests that run before anything
+    calls ``colors_enabled()``. The default alphabetical order hides the
+    failure only because ``test_api_key_accounts`` happens to latch ``False``
+    first; that is an accident of collection order, not a guarantee.
 
     Tests that exercise the detection itself set the variables explicitly,
     which overrides this.
     """
     monkeypatch.delenv("FORCE_COLOR", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr("claude_swap.printer._colors_enabled", None)
