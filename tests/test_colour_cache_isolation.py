@@ -42,8 +42,11 @@ mistaken for evidence.
 
 from __future__ import annotations
 
+import os
 import sys
 from io import StringIO
+
+import pytest
 
 from claude_swap import printer
 
@@ -102,8 +105,15 @@ def test_the_next_test_is_not_themed_by_it(monkeypatch):
     )
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="pty/termios are POSIX; the query returns at line 95 there"
+)
 def test_the_suite_does_not_query_the_developers_terminal(monkeypatch):
     """`detect_terminal_background` must not reach a real tty from the suite.
+
+    POSIX only, and not merely because `pty` is missing on Windows: the
+    function's first gate is `os.name == "nt"`, so there is no terminal query
+    to guard there in the first place.
 
     It puts the tty into cbreak, writes an OSC-11 query, and blocks reading
     stdin for up to a second. Under `pytest -s` stdin IS the developer's
