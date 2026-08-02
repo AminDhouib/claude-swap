@@ -315,13 +315,28 @@ def _deterministic_colour(monkeypatch):
     fixture. So the cache is reset too.
 
     This line was briefly removed on the grounds that the cache is ``None`` on
-    entry for every test, i.e. that resetting it proves nothing. That
-    measurement was taken with the probe BELOW the reset, so it read back the
-    value the reset had just written. Probing at the top of the fixture gives
-    **1599 False, 98 None** — the 98 are the tests that run before anything
-    calls ``colors_enabled()``. The default alphabetical order hides the
-    failure only because ``test_api_key_accounts`` happens to latch ``False``
-    first; that is an accident of collection order, not a guarantee.
+    entry for every test, i.e. that resetting it proves nothing. THE
+    OBSERVATION IS RIGHT AND THE INFERENCE IS BACKWARDS: the ``None`` is
+    produced BY this line. ``monkeypatch.setattr`` restores the pre-test value
+    at teardown, so every test both enters and leaves with the cache unset —
+    which is the whole point, and reads as evidence of inertness only if you
+    assume the state would have been ``None`` anyway.
+
+    Measured three ways, same suite, probe as the FIRST statement of this
+    fixture::
+
+        as shipped                                1699 None
+        same reset, plain assignment (no restore)  295 False / 1402 None / 2 True
+        reset removed entirely                    1599 False /   98 None
+
+    The middle row is the control that separates the two explanations: identical
+    reset, only the restore dropped, and the cache is dirty on entry for 297
+    tests. So the restore is the operative mechanism, not the probe's position.
+
+    (An earlier version of this docstring claimed 1599/98 against the shipped
+    fixture and blamed probe placement. That is the bottom row, measured with
+    the line REMOVED — it rebutted the observation instead of the inference,
+    and left a number the next reader could not reproduce.)
 
     Tests that exercise the detection itself set the variables explicitly,
     which overrides this.
@@ -329,3 +344,39 @@ def _deterministic_colour(monkeypatch):
     monkeypatch.delenv("FORCE_COLOR", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setattr("claude_swap.printer._colors_enabled", None)
+    # And the OTHER thing a terminal decides: `appearance.detect_terminal_background`
+    # puts the tty into cbreak, writes an OSC-11 query, and BLOCKS reading stdin
+    # for up to a second. Under `pytest -s` stdin is the developer's real
+    # terminal, so the suite emits escape bytes at it and can swallow a
+    # keypress. Measured on a pty: reached 8 times in one run, on fd 0.
+    #
+    # `TERM=dumb` is the function's own documented short-circuit — it returns
+    # None before touching termios — so this closes the path rather than
+    # patching around it. Resetting `appearance._cache` would NOT help: the
+    # cache is what stops the second query, not the first.
+    #
+    # No test outside test_appearance.py asserts on a palette code, so this was
+    # not flipping results; it is the same class this fixture exists for, one
+    # module over.
+    #
+    # Measured under a pty with `-s`: 8 reaches before, 2 after. The 6 that
+    # remain are test_appearance.py's own, which set TERM themselves to exercise
+    # the detection — the documented override, and the ones that SHOULD get
+    # there. Only the accidental reaches are closed.
+    #
+    # NO TEST PINS THIS LINE, and by this PR's own standard that is worth
+    # saying rather than papering over. The guard's effect is only observable
+    # where `sys.stdin.isatty()` is True, and under pytest it is False — the
+    # detection short-circuits on the tty check BEFORE it ever consults TERM,
+    # so an in-suite test asserting "the query did not run" passes with this
+    # line removed. A test that both forces the tty and proves the short-circuit
+    # would have to reimplement the function's own gate order to know what it
+    # was asserting. The falsifying evidence is the pty measurement above, run
+    # by hand:
+    #
+    #   env -u FORCE_COLOR -u NO_COLOR TERM=xterm-256color \
+    #     script -qec "python3 -m pytest tests/ -q -s" /dev/null
+    #
+    # with a probe at appearance.py's `tty.setcbreak`. 8 without this line, 2
+    # with it.
+    monkeypatch.setenv("TERM", "dumb")

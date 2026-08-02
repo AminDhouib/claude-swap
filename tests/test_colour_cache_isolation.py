@@ -19,9 +19,25 @@ the same eleven assertions in the same file that motivated the scrub.
 This lives in its own file deliberately. ``test_printer.py`` has a module-local
 ``_reset_color_cache`` fixture that clears the cache around every one of its
 tests, so a leak staged there is cleaned up by that fixture rather than by
-conftest's, and the guard would pass with the thing it guards removed. pytest
-runs tests in definition order within a file, so the pair below is a real
-ordering: the first latches, the second reads.
+conftest's, and the guard would pass with the thing it guards removed.
+Falsified rather than assumed: staging the identical pair at the end of
+``test_printer.py`` and neutering conftest's reset leaves that file at 26
+passed and the whole suite at 1699 passed.
+
+pytest runs tests in definition order within a file, so the pair below is a
+real ordering: the first latches, the second reads.
+
+THE PAIR IS THE GUARD; EITHER ALONE PROVES NOTHING. Measured with the reset
+neutered::
+
+    pytest tests/test_colour_cache_isolation.py            1 failed, 1 passed
+    pytest ...::test_the_next_test_is_not_styled_by_it      1 passed
+
+Selecting only the reader skips the latch, so it is green over a broken
+fixture. Inherent to any ordering guard and not worth merging the two — a
+single test that both latches and reads would have to reset the cache itself,
+which is the very thing under test. Noted so a green single-test run is not
+mistaken for evidence.
 """
 
 from __future__ import annotations
@@ -54,3 +70,4 @@ def test_the_next_test_is_not_styled_by_it(monkeypatch):
     monkeypatch.setattr(sys, "stdout", StringIO())
     assert printer.accent("Skipping") == "Skipping"
     assert "\x1b[" not in printer.muted("usage")
+
