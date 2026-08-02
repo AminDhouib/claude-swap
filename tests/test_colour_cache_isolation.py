@@ -105,9 +105,9 @@ def test_the_next_test_is_not_themed_by_it(monkeypatch):
     """The `_theme` reset is what makes this pass.
 
     `printer._theme` is the other latched global in this module, and the leak
-    is real: measured 1582 dark / 118 light on fixture entry before the reset,
-    the 118 being test_usage_store (90), test_update_check (26) and test_tui
-    (2). Green without it only because none of those asserts a palette code —
+    is real: measured 1581 dark / 121 light on fixture entry before the reset,
+    the 121 being test_usage_store (90), test_update_check (26), this guard
+    file (2), test_tui (2) and test_config_cli (1). Green without it only because none of those asserts a palette code —
     which is exactly what was true of `_colors_enabled` until someone exported
     FORCE_COLOR.
 

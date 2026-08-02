@@ -380,6 +380,7 @@ def _deterministic_colour(monkeypatch):
     # of 30 for the theme. This assertion runs before every test, so no
     # ordering hides a latch: same mutants, same seeds, 1694 and 1684 errors.
     # Costs nothing today (1702 passed, 3 skipped with the fixture intact).
+    from claude_swap import appearance as _appearance
     from claude_swap import printer as _printer
 
     assert _printer._colors_enabled is None, (
@@ -403,6 +404,19 @@ def _deterministic_colour(monkeypatch):
     # none of them asserts a palette code — which is exactly what was true of
     # `_colors_enabled` until a developer exported FORCE_COLOR.
     monkeypatch.setattr("claude_swap.printer._theme", "dark")
+    # The third `global`-rebound name in the package. Inert under the TERM pin
+    # below, which makes `detect_terminal_background` return before ever
+    # writing it — but the pin is a guarantee about the tty QUERY, not about
+    # the cache, and the cache then latches that `None` against any test that
+    # stubs `_query_terminal_background`. Measured, two added tests and no
+    # mutation of this fixture: a leaker at the top of collection poisons 28
+    # later tests sequentially and 473 at `--randomly-seed=7`, and a
+    # detect-then-read pair fails while the reader alone passes — the same
+    # shape this file's guard narrates for `_colors_enabled`.
+    #
+    # `tests/test_appearance.py` carries a module-local reset for exactly this
+    # reason, which is the layer this fixture exists to replace.
+    monkeypatch.setattr("claude_swap.appearance._cache", _appearance._UNSET)
     # And the OTHER thing a terminal decides: `appearance.detect_terminal_background`
     # puts the tty into cbreak, writes an OSC-11 query, and BLOCKS reading stdin
     # for up to a second. Under `pytest -s` stdin is the developer's real
@@ -411,8 +425,10 @@ def _deterministic_colour(monkeypatch):
     #
     # `TERM=dumb` is the function's own documented short-circuit — it returns
     # None before touching termios — so this closes the path rather than
-    # patching around it. Resetting `appearance._cache` would NOT help: the
-    # cache is what stops the second query, not the first.
+    # patching around it. It is a guarantee about the QUERY and not about the
+    # cache, which is why the cache is reset above: the pin makes detection
+    # return None fast, and the cache then latches that None against any test
+    # that stubs `_query_terminal_background`.
     #
     # No test outside test_appearance.py asserts on a palette code, so this was
     # not flipping results; it is the same class this fixture exists for, one
