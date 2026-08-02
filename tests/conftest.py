@@ -326,13 +326,15 @@ def _deterministic_colour(monkeypatch):
     fixture::
 
         as shipped                                1702 None
-        same reset, plain assignment (no restore)  296 False / 1403 None /   3 True
-        reset removed entirely                    1186 False /  418 True /  98 None
+        same reset, plain assignment (no restore)  301 False / 1386 None /  15 True
+        reset removed entirely                     775 False /  919 True /   8 None
 
-    THE SHAPE IS THE POINT, NOT THE DIGITS. These have now been stale three
+    THE SHAPE IS THE POINT, NOT THE DIGITS. These have now been stale four
     times running, every time for the same reason: the commit that changes the
     guard file also changes the denominator, and the numbers get copied from
-    the run made before the tests were added. What must hold is
+    the run made before the tests were added. The fourth was this branch
+    itself — deleting `test_printer.py`'s module-local `_reset_color_cache`
+    moved rows 2 and 3, exactly the effect the paragraph below describes. What must hold is
     `shipped == all None` — the VALUE, not merely "not latched" — and
     `removed == mostly not-None`; the exact counts move with the suite and are
     here as evidence of the mechanism, not as a contract. Re-take them with a
@@ -350,10 +352,10 @@ def _deterministic_colour(monkeypatch):
     this reset now protects five times fewer tests, and only the digits say so.
 
     The middle row is the control that separates the two explanations: identical
-    reset, only the restore dropped, and the cache is dirty on entry for 297
+    reset, only the restore dropped, and the cache is dirty on entry for 316
     tests. So the restore is the operative mechanism, not the probe's position.
 
-    The bottom row's 418 ``True`` START at this fixture's own guard file:
+    The bottom row's 919 ``True`` START at this fixture's own guard file:
     ``test_colour_cache_isolation.py`` latches the cache by plain assignment on
     purpose, and with the reset gone nothing clears it. They are spread across
     the files that run after it — test_oauth (98), test_menubar (64),
@@ -383,11 +385,23 @@ def _deterministic_colour(monkeypatch):
     from claude_swap import appearance as _appearance
     from claude_swap import printer as _printer
 
-    assert _printer._colors_enabled is None, (
+    # SNAPSHOT FIRST, ASSERT ON THE SNAPSHOT. The obvious form — asserting the
+    # globals directly — depends on sitting ABOVE the resets, and nothing in
+    # the code says so: moving the two `setattr` lines up makes each assert
+    # read the value the reset just wrote, which is green on seq, `-n 4` and
+    # nine seeds with no line deleted. Proof that is a real kill and not a
+    # no-op: a session-scoped fixture latching `True`/`"light"` gives 1702
+    # errors in the shipped order and 1702 PASSED reordered — same latch,
+    # opposite verdict.
+    #
+    # Reading into a local on the fixture's first statement makes the
+    # detection independent of where the assertions live.
+    inherited = (_printer._colors_enabled, _printer._theme)
+    assert inherited[0] is None, (
         "a previous test latched the colour cache and nothing reset it, or a "
         "broader-scoped fixture latched it during setup"
     )
-    assert _printer._theme == "dark", (
+    assert inherited[1] == "dark", (
         "a previous test latched the theme, or a broader-scoped fixture "
         "latched it during setup"
     )

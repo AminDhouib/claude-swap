@@ -16,13 +16,20 @@ tests (``test_migrations``, ``test_printer``, ``test_swap_accounts``,
 
 the same eleven assertions in the same file that motivated the scrub.
 
-This lives in its own file deliberately. ``test_printer.py`` has a module-local
-``_reset_color_cache`` fixture that clears the cache around every one of its
-tests, so a leak staged there is cleaned up by that fixture rather than by
-conftest's, and the guard would pass with the thing it guards removed.
-Falsified rather than assumed: staging the identical pair at the end of
-``test_printer.py`` and neutering conftest's reset leaves that file and the
-whole suite green — the module-local fixture swallows the leak.
+This lives in its own file because ``test_printer.py`` USED TO carry a
+module-local ``_reset_color_cache`` fixture that cleaned up any leak staged
+there, so a guard living in that file would have passed with the thing it
+guards removed. This branch deletes that fixture — it was hiding the pin-False
+mutant — so the reason no longer holds: re-running the same experiment on HEAD
+(the identical latch/read pair at the end of ``test_printer.py``, conftest's
+reset neutered) now gives 3 failed, 23 passed. The leak IS caught there today.
+Kept separate anyway, because a guard that moves back into the file it once
+could not live in is one module-local fixture away from silently dying again.
+
+(Re-measured on HEAD: conftest's cache reset removed and the identical
+latch/read pair appended to ``test_printer.py`` gives 6 passed, 20 errors in
+that file — the entry assertion fires on every test after the latch. The leak
+is caught there now; before this branch it was swallowed.)
 
 pytest runs tests in definition order within a file, so the pair below is a
 real ordering: the first latches, the second reads.
@@ -168,6 +175,21 @@ def test_the_suite_does_not_query_the_developers_terminal(monkeypatch):
 
         assert appearance.detect_terminal_background() is None
 
+        # AND the pin must be the value that also keeps COLOUR off, checked
+        # HERE while stdout is still the pty — outside this block stdout is
+        # pytest's capture object, `isatty()` is False, and the check passes
+        # for a reason that has nothing to do with TERM.
+        #
+        # `appearance` short-circuits on both `dumb` and `linux`
+        # (appearance.py:97), so the emitted bytes cannot tell them apart:
+        # measured, changing the pin to `linux` left the whole suite green on
+        # seq, `-n 4` and eight seeds. `printer` tests only `== "dumb"`
+        # (printer.py:97), so `linux` re-enables the styling this fixture
+        # exists to suppress. The two modules disagree and only one of them
+        # was covered.
+        printer._colors_enabled = None
+        colours_on = printer.colors_enabled()
+
         os.set_blocking(master, False)
         try:
             emitted = os.read(master, 4096)
@@ -179,4 +201,8 @@ def test_the_suite_does_not_query_the_developers_terminal(monkeypatch):
 
     assert b"\x1b]11;?" not in emitted, (
         f"the OSC-11 query hit the terminal: {emitted!r}"
+    )
+    assert colours_on is False, (
+        f"TERM={os.environ.get('TERM')!r} blocks the OSC-11 query but not "
+        "colour detection; under `-s` the suite styles its own assertions"
     )
