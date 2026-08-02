@@ -346,7 +346,7 @@ def _deterministic_colour(monkeypatch):
     un-latching and started PINNING, a different mechanism with the same
     signature. (The `True` direction is caught: 12 failures.) A large move in
     row 3's `None` count is the other signal worth reading — adding a
-    module-local cache reset to one more test file takes it 98 -> 514, meaning
+    module-local cache reset to `test_switcher.py` takes it 98 -> 514, meaning
     this reset now protects five times fewer tests, and only the digits say so.
 
     The middle row is the control that separates the two explanations: identical
@@ -383,9 +383,13 @@ def _deterministic_colour(monkeypatch):
     from claude_swap import printer as _printer
 
     assert _printer._colors_enabled is None, (
-        "a previous test latched the colour cache and nothing reset it"
+        "a previous test latched the colour cache and nothing reset it, or a "
+        "broader-scoped fixture latched it during setup"
     )
-    assert _printer._theme == "dark", "a previous test latched the theme"
+    assert _printer._theme == "dark", (
+        "a previous test latched the theme, or a broader-scoped fixture "
+        "latched it during setup"
+    )
     monkeypatch.delenv("FORCE_COLOR", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setattr("claude_swap.printer._colors_enabled", None)
