@@ -298,14 +298,20 @@ def _deterministic_colour(monkeypatch):
     '\\x1b[38;5;173mSkipping\\x1b[0m Account-2 (disabled)'``, and the same
     tree green with the variable unset.
 
-    ``printer._colors_enabled`` is reset too: it is filled for most of a
-    session (measured non-None for 1599 of 1698 tests), so the scrub decides
-    the verdict only once and one test latching it True would colour every
-    test after.
+    Deliberately does NOT reset ``printer._colors_enabled``. That line was
+    here, justified by "measured non-None for 1599 of 1698 tests" — and the
+    measurement does not hold: instrumenting this fixture reports the cache
+    ``None`` on entry for 1697 of 1697 tests. Nothing styles at import or
+    collection time, so the flag is still unset whenever the scrub runs, and
+    removing the reset leaves the suite identical under ``FORCE_COLOR=3``,
+    ``NO_COLOR=1`` and neither (1697 passed each way).
+
+    An unfalsifiable guard is worse than none — it reads as protection while
+    proving nothing, which is exactly why this PR already excluded that same
+    reset from the production path. Applying the rule to our own line too.
 
     Tests that exercise the detection itself set the variables explicitly,
     which overrides this.
     """
     monkeypatch.delenv("FORCE_COLOR", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
-    monkeypatch.setattr("claude_swap.printer._colors_enabled", None)

@@ -247,6 +247,14 @@ class TestColourEnvDoesNotLeakIntoTests:
         variables gone, detection has to fall through to the captured-stdout
         ``isatty()`` check, so forcing that to report a TTY must flip it.
         A surviving NO_COLOR would pin it False regardless.
+
+        TERM is pinned for the same reason the fixture scrubs the other two:
+        detection consults it AFTER isatty(), so on a ``TERM=dumb`` terminal —
+        Emacs M-x shell, some CI shells — this assertion fails for a reason
+        that has nothing to do with what it is guarding. Removing one
+        environment dependency from the suite while adding a narrower one is
+        the same defect in a smaller coat.
         """
+        monkeypatch.setenv("TERM", "xterm-256color")
         monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
         assert printer.colors_enabled() is True
