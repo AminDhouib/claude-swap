@@ -71,3 +71,86 @@ def test_the_next_test_is_not_styled_by_it(monkeypatch):
     assert printer.accent("Skipping") == "Skipping"
     assert "\x1b[" not in printer.muted("usage")
 
+
+
+def test_a_test_may_latch_the_theme(monkeypatch):
+    """Stands in for `tui/app.py`'s `set_theme("light")`, which nothing restores."""
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    printer._colors_enabled = None
+    printer.set_theme("light")
+    assert "38;2;149;76;42" in printer.accent("x")   # premise: light is live
+
+
+def test_the_next_test_is_not_themed_by_it(monkeypatch):
+    """The `_theme` reset is what makes this pass.
+
+    `printer._theme` is the other latched global in this module, and the leak
+    is real: measured 1582 dark / 118 light on fixture entry before the reset,
+    the 118 being test_usage_store (90), test_update_check (26) and test_tui
+    (2). Green without it only because none of those asserts a palette code —
+    which is exactly what was true of `_colors_enabled` until someone exported
+    FORCE_COLOR.
+
+    Asserts on the palette bytes rather than on `printer._theme`, for the same
+    reason the cache guard above asserts on output: the private name being
+    right proves nothing about what a caller renders.
+    """
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    printer._colors_enabled = None
+    assert "38;5;173" in printer.accent("x"), (
+        "the previous test's light theme outlived it"
+    )
+
+
+def test_the_suite_does_not_query_the_developers_terminal(monkeypatch):
+    """`detect_terminal_background` must not reach a real tty from the suite.
+
+    It puts the tty into cbreak, writes an OSC-11 query, and blocks reading
+    stdin for up to a second. Under `pytest -s` stdin IS the developer's
+    terminal, so the suite emits escape bytes at it and can swallow a keypress.
+
+    A real pty makes both `isatty()` calls genuinely True, which removes the
+    gate that masks this under plain pytest — so the only thing left standing
+    between the suite and the terminal is the fixture's TERM pin, and the
+    assertion reads the pty master to see whether the query actually went out.
+    Asserting on the BYTES rather than on `os.environ["TERM"]`: the variable
+    being right proves nothing about whether the function short-circuited, and
+    a box whose TERM is already dumb would pass for free.
+
+    Deliberately does NOT set TERM itself. Doing so overrides the fixture pin
+    and turns this into a test of its own setup — measured, it flips a passing
+    guard into a failing one.
+    """
+    import io
+    import os
+    import pty
+
+    from claude_swap import appearance
+
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("STY", raising=False)
+    monkeypatch.setattr(appearance, "_cache", appearance._UNSET)
+
+    master, slave = pty.openpty()
+    try:
+        stream = io.TextIOWrapper(
+            io.FileIO(slave, "r+", closefd=False), write_through=True
+        )
+        monkeypatch.setattr(sys, "stdin", stream)
+        monkeypatch.setattr(sys, "stdout", stream)
+        assert sys.stdin.isatty() and sys.stdout.isatty(), "premise: a real tty"
+
+        assert appearance.detect_terminal_background() is None
+
+        os.set_blocking(master, False)
+        try:
+            emitted = os.read(master, 4096)
+        except BlockingIOError:
+            emitted = b""
+    finally:
+        os.close(master)
+        os.close(slave)
+
+    assert b"\x1b]11;?" not in emitted, (
+        f"the OSC-11 query hit the terminal: {emitted!r}"
+    )
