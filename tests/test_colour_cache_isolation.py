@@ -41,20 +41,24 @@ IS NOT GUARANTEED. Measured with the reset neutered::
     pytest ...::test_the_next_test_is_not_styled_by_it      1 passed
 
 Selecting only the reader skips the latch, so it is green over a broken
-fixture — and so does ANY ordering that puts the reader first. Measured with
-the guard mutated by line number (landing asserted), seeds named so the figure
-is re-takeable::
+fixture — and so does ANY ordering that puts the reader first, including
+`-n 4`, where the two land on different workers and neither latch reaches its
+reader at all.
 
-    file-scoped, seeds 1-30   cache escaped  6 (4 5 12 13 24 25)
-                              theme escaped 17 (1 2 7 8 9 11 12 14 16 17 18
-                                                19 20 21 23 26 28)
-    full suite, -p randomly   cache: seeds 4 and 5 -> 1702 passed, 3 skipped
-                              theme: seeds 1 and 2 -> 1702 passed, 3 skipped
-    file-scoped, -n 4         both mutants -> 5 passed
+THE SEED TABLE THAT USED TO SIT HERE IS GONE, deliberately. It named six
+cache seeds and seventeen theme seeds as escapes, and none of the four
+headline figures re-measures on this tree: re-run against the same mutants,
+the file-scoped pair passes at every seed tried (4 5 7 12 13 24 25 27 29),
+and a reviewer taking it a third way got numbers different from both. The
+condition those digits described is no longer reconstructible — deleting
+`test_printer.py`'s module-local reset in this same branch moved the
+denominator, which is the fourth time a table in this file or its sibling has
+gone stale for exactly that reason.
 
-So the escape is NOT bounded to file-scoped runs, which an earlier version of
-this paragraph claimed. Under `-n 4` the two land on different workers, hence
-different processes, and neither latch reaches its reader at all.
+A figure nobody can re-take is not evidence, and it invites the next reader
+to trust it. What survives is the CLAIM, which does still measure: with the
+reset mutated out, an ordering that puts the reader first escapes, and the
+pair alone therefore proves nothing.
 
 What closes the hole is the post-condition in `conftest._deterministic_colour`,
 which asserts both globals are unlatched on entry to EVERY test — no ordering

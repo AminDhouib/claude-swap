@@ -341,15 +341,23 @@ def _deterministic_colour(monkeypatch):
     probe as the FIRST statement of this fixture body when they matter, and do
     not trust a figure that does not reproduce.
 
-    The value matters because a wrong one satisfies the shape. Measured:
-    pinning `False` instead of `None` leaves 1702 passed and a probe reading
-    `1702 None`, identical to shipped — and then both `delenv` lines can be
-    deleted and the suite stays green on a clean box. The reset has stopped
-    un-latching and started PINNING, a different mechanism with the same
-    signature. (The `True` direction is caught: 12 failures.) A large move in
-    row 3's `None` count is the other signal worth reading — adding a
-    module-local cache reset to `test_switcher.py` takes it 98 -> 514, meaning
-    this reset now protects five times fewer tests, and only the digits say so.
+    The value matters because a wrong one satisfies the shape: pinning `False`
+    instead of `None` leaves the probe reading all-None, identical to shipped,
+    while the reset has stopped un-latching and started PINNING — a different
+    mechanism with the same signature.
+
+    THIS BRANCH CLOSED IT, and only by deleting `test_printer.py`'s
+    module-local `_reset_color_cache`, which was cleaning up after the mutant
+    inside the one file that would have noticed. Re-measured here: pin-False
+    now gives 9 failed, headed by
+    `test_bold_accent_with_colors_enabled`. (Before that deletion it was 1702
+    passed, and both `delenv` lines could be dropped on top with the suite
+    still green.) The `True` direction was always caught: 12 failures.
+
+    A large move in row 3's `None` count is the other signal worth reading —
+    a module-local cache reset added to `test_switcher.py` would take it up
+    sharply, meaning this reset protects that many fewer tests, and only the
+    digits say so.
 
     The middle row is the control that separates the two explanations: identical
     reset, only the restore dropped, and the cache is dirty on entry for 316
