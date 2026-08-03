@@ -214,3 +214,49 @@ def test_the_suite_does_not_query_the_developers_terminal(monkeypatch):
         f"TERM={os.environ.get('TERM')!r} blocks the OSC-11 query but not "
         "colour detection; under `-s` the suite styles its own assertions"
     )
+
+
+class TestSharedMonkeypatchUndoLeaksTheAutouseScrub:
+    """H-1, mechanism proof: pytest hands out ONE `MonkeyPatch` per test
+    regardless of how many fixtures request it, so a test's own
+    `monkeypatch` parameter is the SAME instance `_deterministic_colour`
+    used to scrub `FORCE_COLOR`. Calling `.undo()` on it unwinds every
+    patch made through that instance, not just the caller's own -- which is
+    what `tests/test_move_accounts.py` and `tests/test_swap_accounts.py`
+    did at 8 sites, reintroducing whatever `FORCE_COLOR` the developer's
+    shell actually has exported for the rest of that test.
+
+    Simulated the way `test_printer.py`'s `_exported` simulates a real
+    export: a class-scoped `MonkeyPatch.context()` sets `FORCE_COLOR` before
+    the function-scoped autouse fixture runs, standing in for a developer
+    box where the variable was already in the shell before pytest started.
+
+    Measured directly against the two files: with `FORCE_COLOR=3` exported
+    class-scoped here, `monkeypatch.undo()` (the pattern all 8 sites used)
+    reintroduces it -- confirming the finding -- while
+    `pytest.MonkeyPatch.context()` (the fix applied at all 8 sites) does
+    not. Both are asserted below so a regression to the old pattern would
+    be caught by the same mechanism that proved the bug.
+    """
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _exported(self):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv("FORCE_COLOR", "3")
+            yield
+
+    def test_undo_on_the_shared_instance_leaks_it(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", sys.platform)  # any patch works
+        monkeypatch.undo()
+        assert os.environ.get("FORCE_COLOR") == "3", (
+            "expected the pre-existing bug: undo() on the fixture's shared "
+            "instance restores the developer's real FORCE_COLOR"
+        )
+
+    def test_scoped_context_does_not_leak_it(self):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(sys, "platform", sys.platform)
+        assert os.environ.get("FORCE_COLOR") is None, (
+            "the fix (a scoped MonkeyPatch.context()) must not touch the "
+            "autouse scrub"
+        )
