@@ -37,35 +37,35 @@ real ordering: the first latches, the second reads.
 THE PAIR IS THE GUARD; EITHER ALONE PROVES NOTHING, AND THE ORDERING IT NEEDS
 IS NOT GUARANTEED. Measured with the reset neutered::
 
-    pytest tests/test_colour_cache_isolation.py            1 failed, 1 passed
+    pytest tests/test_colour_cache_isolation.py            the pair goes red
     pytest ...::test_the_next_test_is_not_styled_by_it      1 passed
 
 Selecting only the reader skips the latch, so it is green over a broken
 fixture — and so does ANY ordering that puts the reader first, including
 `-n 4`, where the two land on different workers and neither latch reaches its
-reader at all.
+reader at all. The SAME is true of the theme pair below: with the theme reset
+mutated out, `test_the_next_test_is_not_themed_by_it` alone is `1 passed`.
+Both pairs, not just the cache one.
 
-THE SEED TABLE THAT USED TO SIT HERE IS GONE, deliberately. It named six
-cache seeds and seventeen theme seeds as escapes, and none of the four
-headline figures re-measures on this tree: re-run against the same mutants,
-the file-scoped pair passes at every seed tried (4 5 7 12 13 24 25 27 29),
-and a reviewer taking it a third way got numbers different from both. The
-condition those digits described is no longer reconstructible — deleting
-`test_printer.py`'s module-local reset in this same branch moved the
-denominator, which is the fourth time a table in this file or its sibling has
-gone stale for exactly that reason.
+THE SEED TABLE THAT USED TO SIT HERE IS GONE. What it claimed was that the
+digits were no longer reconstructible; they are, and the earlier note reached
+the opposite conclusion by sampling only the seeds at which the mutant escapes
+(4 5 7 12 13 24 25 27 29) and reading a uniform result as noise. Re-measured
+under the condition that actually isolates this pair — cache reset mutated out
+AND conftest's entry assertions disabled, since otherwise the assertions are
+what fails and the pair is not what is being tested — the file-scoped run
+escapes at exactly those 9 of seeds 1-30, and 17 of 30 for the theme.
 
-A figure nobody can re-take is not evidence, and it invites the next reader
-to trust it. What survives is the CLAIM, which does still measure: with the
-reset mutated out, an ordering that puts the reader first escapes, and the
-pair alone therefore proves nothing.
+The count is what the claim needs; the table of per-seed digits was not, and
+maintaining it by hand in two files is what produced the wrong reading. The
+count lives in `conftest.py` beside the assertion it is about, once.
 
 What closes the hole is the post-condition in `conftest._deterministic_colour`,
 which asserts both globals are unlatched on entry to EVERY test — no ordering
-required. Same mutants, same seeds: 1694 and 1684 errors. This pair stays as
-the readable narrative of what the leak looks like; it is not what makes the
-suite safe. Merging the two into one test would not help either — it would
-have to reset the global itself, which is the thing under test.
+required. This pair stays as the readable narrative of what the leak looks
+like; it is not what makes the suite safe. Merging the two into one test would
+not help either — it would have to reset the global itself, which is the thing
+under test.
 """
 
 from __future__ import annotations
@@ -116,11 +116,15 @@ def test_the_next_test_is_not_themed_by_it(monkeypatch):
     """The `_theme` reset is what makes this pass.
 
     `printer._theme` is the other latched global in this module, and the leak
-    is real: measured 1581 dark / 121 light on fixture entry before the reset,
-    the 121 being test_usage_store (90), test_update_check (26), this guard
-    file (2), test_tui (2) and test_config_cli (1). Green without it only because none of those asserts a palette code —
-    which is exactly what was true of `_colors_enabled` until someone exported
+    is real: with the reset removed, tests in several later files enter with
+    the light palette, so the latch outlives the file that set it. Green
+    without it only because none of them asserts a palette code — which is
+    exactly what was true of `_colors_enabled` until someone exported
     FORCE_COLOR.
+
+    (The count and per-file breakdown that used to be here were hand-copied
+    from `conftest.py` and were wrong in both copies; they are gone from both.
+    See the note beside the `_theme` reset.)
 
     Asserts on the palette bytes rather than on `printer._theme`, for the same
     reason the cache guard above asserts on output: the private name being

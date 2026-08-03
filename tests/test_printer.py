@@ -208,7 +208,36 @@ class TestColourEnvDoesNotLeakIntoTests:
     assert on OUTPUT: checking only ``"FORCE_COLOR" not in os.environ``
     passes for free on any box that never exported it, which is most
     boxes and every CI runner.
+
+    ASSERTING ON OUTPUT IS NOT ENOUGH ON ITS OWN, which is what ``_exported``
+    below is for. Measured: with BOTH ``delenv`` lines deleted from the fixture
+    and neither variable exported, the whole suite is 1702 passed — so in the
+    environment CI actually runs in, the two scrubs were dead code no test
+    could kill. Their coverage existed only on a box whose developer had
+    exported the variable, i.e. only under the condition this change exists to
+    remove. A guard is not covered by a test that needs the bug to be
+    happening already.
     """
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _exported(self):
+        """Export both variables BEFORE ``_deterministic_colour`` runs.
+
+        A test cannot set them in its own body: the fixture has already
+        scrubbed by then, so the assignment lands after the thing under test
+        and proves nothing. Class scope is what buys the ordering — pytest
+        instantiates higher-scoped fixtures first, so this runs ahead of the
+        function-scoped conftest one. (A module-level FUNCTION-scoped autouse
+        fixture would run after it instead, which is the same trap one level
+        down.)
+
+        Scoped to this class, not the module, so the export cannot reach a
+        test that is not about it.
+        """
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv("FORCE_COLOR", "3")
+            mp.setenv("NO_COLOR", "1")
+            yield
 
     def test_styled_output_is_plain(self, monkeypatch):
         """The reduced form of the 11 test_switcher failures.
