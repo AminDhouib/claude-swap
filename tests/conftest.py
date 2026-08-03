@@ -303,103 +303,47 @@ def _deterministic_colour(monkeypatch):
     ``printer._colors_enabled`` and every later call returns it, so one test
     that latches ``True`` decides the styling for every test after it —
     whatever the environment says by then. Under ``pytest -s`` stdout stays
-    the real terminal, ``isatty()`` is True, and the tests that latch are
-    ordinary ones nobody would suspect: ``test_migrations``, ``test_printer``,
-    ``test_swap_accounts``, ``test_transfer``, ``test_tui``. Measured on a pty
-    with no colour variable set at all::
+    the real terminal, so ``isatty()`` is True and ordinary tests latch it
+    without meaning to. So the cache is reset too, on every entry, not just
+    the two environment variables.
 
-        pytest tests/test_migrations.py tests/test_switcher.py -q -s
-        11 failed, 382 passed
+    A wrong reset can satisfy a shape check that only looks at "not latched":
+    pinning `False` instead of `None` also leaves every test entering
+    unlatched, while having switched from un-latching to PINNING — a
+    different, wrong mechanism with the same signature. Both directions are
+    covered: `test_printer.py`'s `TestColourEnvDoesNotLeakIntoTests` dies
+    under either pin, not just under "reset removed".
 
-    which is the same eleven assertions, in the same file, that motivated this
-    fixture. So the cache is reset too.
-
-    This line was briefly removed on the grounds that the cache is ``None`` on
-    entry for every test, i.e. that resetting it proves nothing. THE
-    OBSERVATION IS RIGHT AND THE INFERENCE IS BACKWARDS: the ``None`` is
-    produced BY this line. ``monkeypatch.setattr`` restores the pre-test value
-    at teardown, so every test both enters and leaves with the cache unset —
-    which is the whole point, and reads as evidence of inertness only if you
-    assume the state would have been ``None`` anyway.
-
-    THE SHAPE, MEASURED WITH A PROBE AS THE FIRST STATEMENT OF THIS FIXTURE
-    BODY — and stated without digits, on purpose::
-
-        as shipped                                 every test enters None
-        same reset, plain assignment (no restore)   many enter dirty
-        reset removed entirely                      most enter dirty
-
-    The middle row is the control that separates the two explanations:
-    identical reset, only the restore dropped, and the cache is still dirty on
-    entry. So the RESTORE is the operative mechanism, not the probe's position.
-
-    The value matters because a wrong one satisfies the shape: pinning `False`
-    instead of `None` leaves the probe reading all-None, identical to shipped,
-    while the reset has stopped un-latching and started PINNING — a different
-    mechanism with the same signature. Both directions are covered:
-    `test_printer.py`'s `TestColourEnvDoesNotLeakIntoTests` dies under either
-    pin.
-
-    THE COUNTS THAT USED TO BE HERE ARE GONE, and this is the sixth stale-figure
-    correction, not the first. The five before it each went stale for the SAME
-    reason: the commit that changes the guard file also changes the denominator.
-    The fifth was this branch's own deletion of `test_printer.py`'s module-local
-    `_reset_color_cache`, which moved rows 2 and 3 and made a sentence three
-    lines above this one false, in a paragraph written to warn about exactly
-    that. Row 3 also poisons its own measurement: the guard file latches the
-    cache on purpose and, with the reset gone, everything after it inherits the
-    latch — so the count is partly of this file's own doing.
-
-    A number nobody can re-take is not evidence, and hand-maintaining thirty of
-    them across two files is what produced five wrong ones. What survives is
-    what still measures: `shipped == all None` (the VALUE, not merely "not
-    latched") and `removed == mostly not-None`. Both mutations are run by the
-    suite, so the claim is checked rather than recorded.
+    A number nobody can re-take is not evidence — this fixture's own comments
+    went stale from hand-copied counts more than once, which is why none are
+    kept here now. What's checked instead is the SHAPE: mutating the reset
+    out flips the suite from green to broadly red, and both directions are
+    exercised by real tests rather than recorded as a figure.
 
     Tests that exercise the detection itself set the variables explicitly,
     which overrides this.
     """
     # Ordering-PROOF half of the guard. `test_colour_cache_isolation.py`'s
     # latch/read pairs read as the guard, but they only fire in one ordering:
-    # with the reset mutated out AND these two assertions disabled — the only
-    # state in which the pairs are what is being tested — the file-scoped run
-    # escapes at 9 of seeds 1-30 for the cache and 17 of 30 for the theme.
-    # These assertions run before EVERY test, so no test ORDERING hides a
-    # latch. One shape does escape them, and it is worth naming rather than
-    # overclaiming: a fixture that latches during SETUP after this one. A
-    # conftest fixture runs before a module-level autouse fixture of the same
-    # scope, so an adversary appended to `test_printer.py` latches after the
-    # snapshot is taken — measured, 8 failures all inside that file and this
-    # assertion silent. That is exactly the shape of the two module-local
-    # fixtures this branch deletes, so the fix is to not have them, which is
-    # what it does; the snapshot bounds ordering, not setup order.
-    #
-    # A superseded version of this comment claimed the FULL suite was green at
-    # seeds 4 and 5 under the same mutant. Re-measured: 20 failed and 18 failed.
-    # It went stale from this branch's own deletion of `test_printer.py`'s
-    # module-local reset — 9 of the seed-4 failures are in that file — which is
-    # the fifth time a figure here rotted for that reason and the reason the
-    # counts above this line are gone.
-    #
-    # The 9 escaping seeds are 4 5 7 12 13 24 25 27 29 — the same list
-    # `test_colour_cache_isolation.py` deleted as "no longer reconstructible".
-    # It is reconstructible; that file sampled only escapes and read them as
-    # noise. Kept here as a COUNT, which is what the claim needs, rather than
-    # as a table of digits.
+    # a run that selects only the reader, or splits the pair across workers,
+    # is green over a broken fixture. These assertions run before EVERY
+    # test, so no test ordering hides a latch — only a fixture that latches
+    # during SETUP AFTER this one escapes them (a conftest fixture runs
+    # before a module-level autouse fixture of the same scope). That is
+    # exactly the shape of the two module-local fixtures this branch
+    # deletes, so the fix is to not have them.
     from claude_swap import appearance as _appearance
     from claude_swap import printer as _printer
 
     # SNAPSHOT FIRST, ASSERT ON THE SNAPSHOT. The obvious form — asserting the
     # globals directly — depends on sitting ABOVE the resets, and nothing in
-    # the code says so: moving the two `setattr` lines up makes each assert
-    # read the value the reset just wrote, which is green on seq, `-n 4` and
-    # nine seeds with no line deleted. Proof that is a real kill and not a
-    # no-op: a session-scoped fixture latching `True`/`"light"` gives 1702
-    # errors in the shipped order and 1702 PASSED reordered — same latch,
-    # opposite verdict.
-    #
-    # Reading into a local on the fixture's first statement makes the
-    # detection independent of where the assertions live.
+    # the code says so: moving the two `setattr` lines up would make each
+    # assert read the value the reset just wrote, silently passing regardless
+    # of what the previous test left behind. Reading into a local on the
+    # fixture's first statement makes the detection independent of where the
+    # assertions live, and is itself mutation-tested directly (not via
+    # ordering) by `TestEntryAssertionsCatchAPoisonedGlobal` in
+    # `test_printer.py`.
     inherited = (_printer._colors_enabled, _printer._theme)
     assert inherited[0] is None, (
         "a previous test latched the colour cache and nothing reset it, or a "
@@ -410,88 +354,60 @@ def _deterministic_colour(monkeypatch):
         "latched it during setup"
     )
     # Both scrubs are killed individually ON A CLEAN ENVIRONMENT, which is the
-    # only coverage worth having: measured, with neither variable exported and
-    # both lines deleted, the whole suite was green — so before
-    # `test_printer.py`'s class-scoped `_exported` fixture these two lines were
-    # dead code on every CI runner, guarded only on a box where the bug was
-    # already happening. Drop either one now and its own test dies.
+    # only coverage worth having: with neither variable exported and both
+    # lines deleted, the whole suite is green — so before
+    # `test_printer.py`'s class-scoped `_exported` fixture these two lines
+    # were dead code on every CI runner, guarded only on a box where the bug
+    # was already happening. Drop either one now and its own test dies.
     monkeypatch.delenv("FORCE_COLOR", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setattr("claude_swap.printer._colors_enabled", None)
-    # The OTHER latched global in the same module, closed on the same grounds.
-    # `tui/app.py` calls `printer.set_theme("light")`, a plain assignment with
-    # nothing restoring it, so with this line removed the tests after it enter
-    # with the light palette — spread across several files, not just the one
-    # that latched, so the latch outlives its own reader. Green today only
-    # because none of them asserts a palette code, which is exactly what was
-    # true of `_colors_enabled` until a developer exported FORCE_COLOR.
-    #
-    # (A count and a per-file breakdown lived here and in
-    # `test_colour_cache_isolation.py`, hand-copied into both and wrong in both
-    # by the time it was checked — it missed `test_printer.py`, the file this
-    # branch edits. The leak is what matters and the mutation below proves it;
-    # the digits only had to be maintained in two places.)
+    # The OTHER latched global in the same module. `tui/app.py` calls
+    # `printer.set_theme("light")`, a plain assignment with nothing restoring
+    # it, so with this line removed the tests after it enter with the light
+    # palette — spread across several files, not just the one that latched.
+    # Green today only because none of them asserts a palette code, which is
+    # exactly what was true of `_colors_enabled` until a developer exported
+    # FORCE_COLOR.
     monkeypatch.setattr("claude_swap.printer._theme", "dark")
     # The third `global`-rebound name in the package. Inert under the TERM pin
     # below, which makes `detect_terminal_background` return before ever
     # writing it — but the pin is a guarantee about the tty QUERY, not about
     # the cache, and the cache then latches that `None` against any test that
-    # stubs `_query_terminal_background`. Measured, two added tests and no
-    # mutation of this fixture: a leaker at the top of collection poisons 28
-    # later tests sequentially and 473 at `--randomly-seed=7`, and a
-    # detect-then-read pair fails while the reader alone passes — the same
-    # shape this file's guard narrates for `_colors_enabled`.
-    #
-    # `tests/test_appearance.py` carries a module-local reset for exactly this
-    # reason, which is the layer this fixture exists to replace.
+    # stubs `_query_terminal_background`. `tests/test_appearance.py` carries
+    # a module-local reset for exactly this reason, which is the layer this
+    # fixture exists to replace.
     monkeypatch.setattr("claude_swap.appearance._cache", _appearance._UNSET)
     # And the OTHER thing a terminal decides: `appearance.detect_terminal_background`
     # puts the tty into cbreak, writes an OSC-11 query, and BLOCKS reading stdin
     # for up to a second. Under `pytest -s` stdin is the developer's real
     # terminal, so the suite emits escape bytes at it and can swallow a
-    # keypress. Measured on a pty: reached 8 times in one run, on fd 0.
+    # keypress.
     #
     # `TERM=dumb` is the function's own documented short-circuit — it returns
     # None before touching termios — so this closes the path rather than
     # patching around it. It is a guarantee about the QUERY and not about the
     # cache, which is why the cache is reset above: the pin makes detection
     # return None fast, and the cache then latches that None against any test
-    # that stubs `_query_terminal_background`.
+    # that stubs `_query_terminal_background`. No test outside
+    # test_appearance.py asserts on a palette code, so this was not flipping
+    # results; it is the same class this fixture exists for, one module over.
     #
-    # No test outside test_appearance.py asserts on a palette code, so this was
-    # not flipping results; it is the same class this fixture exists for, one
-    # module over.
-    #
-    # Measured under a pty with `-s`, instrumenting `tty.setcbreak` itself and
-    # with TMUX/STY unset: 0 termios entries with this pin, dozens without it,
-    # across test_cli.py, test_tui.py and this file's own guard. The wall clock
-    # says the same thing without any instrumentation — the run goes from ~41s
-    # to ~72s, which is the OSC-11 read timing out over and over.
-    #
-    # Stated as a magnitude rather than a count on purpose: two earlier notes
-    # here gave 8-and-2 and then 2-and-0, and the second was off by more than
-    # an order of magnitude. The count depends on how many tests reach
-    # detection, which every commit moves; "zero versus many, and the suite
-    # takes half again as long" is the part that stays true and that anyone can
-    # re-take.
+    # Stated as a magnitude, not a count, on purpose: the number of tests that
+    # reach detection moves with every commit, so what stays true and
+    # re-takeable is "zero termios entries with this pin, many without it,
+    # and the suite runs measurably longer without it" (the OSC-11 read
+    # timing out over and over).
     #
     # Pinned by test_the_suite_does_not_query_the_developers_terminal, which
     # opens a real pty so both isatty() calls are genuinely True and the TERM
-    # check at appearance.py:97 is the only gate left, then reads the master to
-    # see whether the query went out. Measured: passes with this line, fails
-    # without it under TERM unset, xterm-256color and screen-256color.
+    # check at appearance.py:97 is the only gate left, then reads the master
+    # to see whether the query went out.
     #
-    # That test also unsets TMUX and STY, and deliberately so: appearance.py:99
-    # short-circuits on either, so a developer running inside tmux would get a
-    # green from the WRONG gate and the TERM pin would look load-bearing when
-    # it was not. This fixture does not pin TMUX/STY — nothing needs it while
-    # TERM is pinned first — but the guard test has to strip them or it proves
-    # nothing about the line it guards.
-    #
-    # An earlier version of this comment said no test COULD pin it, on the
-    # grounds that "the detection short-circuits on the tty check BEFORE it ever
-    # consults TERM". That inverts the source — appearance.py reads TERM at 97
-    # and isatty() at 107. Both gates block under plain pytest, so the
-    # conclusion was accidentally safe while the reason was false, and the false
-    # reason is what made an honest guard look impossible.
+    # That test also unsets TMUX and STY, deliberately: appearance.py:99
+    # short-circuits on either, so a developer running inside tmux would get
+    # a green from the WRONG gate and the TERM pin would look load-bearing
+    # when it was not. This fixture does not pin TMUX/STY — nothing needs it
+    # while TERM is pinned first — but the guard test has to strip them or it
+    # proves nothing about the line it guards.
     monkeypatch.setenv("TERM", "dumb")

@@ -211,13 +211,15 @@ class TestColourEnvDoesNotLeakIntoTests:
     boxes and every CI runner.
 
     ASSERTING ON OUTPUT IS NOT ENOUGH ON ITS OWN, which is what ``_exported``
-    below is for. Measured: with BOTH ``delenv`` lines deleted from the fixture
-    and neither variable exported, the whole suite is 1702 passed — so in the
+    below is for. With BOTH ``delenv`` lines deleted from the fixture and
+    neither variable exported, the whole suite stays fully green — so in the
     environment CI actually runs in, the two scrubs were dead code no test
     could kill. Their coverage existed only on a box whose developer had
     exported the variable, i.e. only under the condition this change exists to
     remove. A guard is not covered by a test that needs the bug to be
-    happening already.
+    happening already. (The class below closes that hole directly, via
+    ``TestEntryAssertionsCatchAPoisonedGlobal`` in this same file — the same
+    argument applied to ``_deterministic_colour``'s own entry assertions.)
     """
 
     @pytest.fixture(autouse=True, scope="class")

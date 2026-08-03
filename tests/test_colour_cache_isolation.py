@@ -4,68 +4,21 @@ Scrubbing ``FORCE_COLOR``/``NO_COLOR`` is only half the job, because detection
 CACHES. ``colors_enabled()`` latches its first answer into
 ``printer._colors_enabled`` and every later call returns it, so a single
 earlier test that latched ``True`` styles every assertion after it no matter
-how thoroughly the environment is cleaned.
+how thoroughly the environment is cleaned. Same story for ``printer._theme``.
 
-Measured, with no colour variable set at all — under ``pytest -s`` stdout stays
-the real terminal, so ``isatty()`` is True and the latch happens in ordinary
-tests (``test_migrations``, ``test_printer``, ``test_swap_accounts``,
-``test_transfer``, ``test_tui``)::
+pytest runs tests in definition order within a file, so each pair below is a
+real ordering: the first test latches, the second reads. THE PAIR IS THE
+GUARD; EITHER ALONE PROVES NOTHING, and the ordering it needs is not
+guaranteed — a run that selects only the reader, or that splits the pair
+across `-n` workers, is green over a broken fixture for a reason that has
+nothing to do with the fixture working.
 
-    pytest tests/test_migrations.py tests/test_switcher.py -q -s
-    11 failed, 382 passed
-
-the same eleven assertions in the same file that motivated the scrub.
-
-This lives in its own file because ``test_printer.py`` USED TO carry a
-module-local ``_reset_color_cache`` fixture that cleaned up any leak staged
-there, so a guard living in that file would have passed with the thing it
-guards removed. This branch deletes that fixture — it was hiding the pin-False
-mutant — so the reason no longer holds: re-running the same experiment on HEAD
-(the identical latch/read pair at the end of ``test_printer.py``, conftest's
-reset neutered) now gives 3 failed, 23 passed. The leak IS caught there today.
-Kept separate anyway, because a guard that moves back into the file it once
-could not live in is one module-local fixture away from silently dying again.
-
-(Re-measured on HEAD: conftest's cache reset removed and the identical
-latch/read pair appended to ``test_printer.py`` gives 6 passed, 20 errors in
-that file — the entry assertion fires on every test after the latch. The leak
-is caught there now; before this branch it was swallowed.)
-
-pytest runs tests in definition order within a file, so the pair below is a
-real ordering: the first latches, the second reads.
-
-THE PAIR IS THE GUARD; EITHER ALONE PROVES NOTHING, AND THE ORDERING IT NEEDS
-IS NOT GUARANTEED. Measured with the reset neutered::
-
-    pytest tests/test_colour_cache_isolation.py            the pair goes red
-    pytest ...::test_the_next_test_is_not_styled_by_it      1 passed
-
-Selecting only the reader skips the latch, so it is green over a broken
-fixture — and so does ANY ordering that puts the reader first, including
-`-n 4`, where the two land on different workers and neither latch reaches its
-reader at all. The SAME is true of the theme pair below: with the theme reset
-mutated out, `test_the_next_test_is_not_themed_by_it` alone is `1 passed`.
-Both pairs, not just the cache one.
-
-THE SEED TABLE THAT USED TO SIT HERE IS GONE. What it claimed was that the
-digits were no longer reconstructible; they are, and the earlier note reached
-the opposite conclusion by sampling only the seeds at which the mutant escapes
-(4 5 7 12 13 24 25 27 29) and reading a uniform result as noise. Re-measured
-under the condition that actually isolates this pair — cache reset mutated out
-AND conftest's entry assertions disabled, since otherwise the assertions are
-what fails and the pair is not what is being tested — the file-scoped run
-escapes at exactly those 9 of seeds 1-30, and 17 of 30 for the theme.
-
-The count is what the claim needs; the table of per-seed digits was not, and
-maintaining it by hand in two files is what produced the wrong reading. The
-count lives in `conftest.py` beside the assertion it is about, once.
-
-What closes the hole is the post-condition in `conftest._deterministic_colour`,
-which asserts both globals are unlatched on entry to EVERY test — no ordering
-required. This pair stays as the readable narrative of what the leak looks
-like; it is not what makes the suite safe. Merging the two into one test would
-not help either — it would have to reset the global itself, which is the thing
-under test.
+What actually closes the hole is the post-condition in
+`conftest._deterministic_colour`, which asserts both globals are unlatched on
+entry to EVERY test — no ordering required, and mutation-killed directly (not
+via ordering) by `TestEntryAssertionsCatchAPoisonedGlobal` in
+`test_printer.py`. These pairs stay as the readable narrative of what the
+leak looks like; they are not what makes the suite safe.
 """
 
 from __future__ import annotations
