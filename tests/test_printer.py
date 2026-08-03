@@ -8,6 +8,7 @@ from io import StringIO
 import pytest
 
 from claude_swap import printer
+from tests.conftest import _deterministic_colour
 
 
 class TestColorDetection:
@@ -277,3 +278,29 @@ class TestColourEnvDoesNotLeakIntoTests:
         monkeypatch.setenv("TERM", "xterm-256color")
         monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
         assert printer.colors_enabled() is True
+
+
+class TestEntryAssertionsCatchAPoisonedGlobal:
+    """The two `assert inherited[...]` lines in `_deterministic_colour`,
+    mutation-killed directly rather than via test ordering.
+
+    Calling the fixture body with a scratch `MonkeyPatch` needs no ordering
+    trick and never touches this test's own fixture instance: poison the
+    global, invoke the guard, and it must raise. Delete either assertion and
+    the matching test below dies (measured).
+    """
+
+    @staticmethod
+    def _invoke_guard():
+        with pytest.MonkeyPatch.context() as mp:
+            _deterministic_colour.__wrapped__(mp)
+
+    def test_kills_colors_enabled_assertion(self, monkeypatch):
+        monkeypatch.setattr(printer, "_colors_enabled", True)
+        with pytest.raises(AssertionError, match="latched the colour cache"):
+            self._invoke_guard()
+
+    def test_kills_theme_assertion(self, monkeypatch):
+        monkeypatch.setattr(printer, "_theme", "light")
+        with pytest.raises(AssertionError, match="latched the theme"):
+            self._invoke_guard()
