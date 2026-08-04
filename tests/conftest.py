@@ -411,3 +411,32 @@ def _deterministic_colour(monkeypatch):
     # while TERM is pinned first — but the guard test has to strip them or it
     # proves nothing about the line it guards.
     monkeypatch.setenv("TERM", "dumb")
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items):
+    """Pin every real-Keychain test to ONE xdist worker.
+
+    ``no_keychain_fake`` means "this test drives the actual ``security`` CLI
+    against a real keychain" -- a process-wide shared resource. Under
+    ``-n auto`` two workers seed and delete the same ``Claude Code-credentials``
+    item, and the reader sees "" where it just wrote a token. Measured on CI
+    (macos-latest, commit 0aa9c1f), green on the previous head serially:
+
+        FAILED test_read_credentials_finds_claude_code_seeded_entry
+        AssertionError: assert '' == 'fake-token-read'
+
+    ``xdist_group`` sends the whole group to one worker, so these serialize
+    against each other while the other ~1900 tests keep running in parallel.
+    A no-op when xdist is not installed: the marker is simply never consumed.
+
+    ``tryfirst`` because xdist reads the group off the item when it builds the
+    schedule. Measured: without it the marker IS applied (verified on the node)
+    and the tests still scattered across 8 workers, indistinguishable from no
+    grouping at all -- a direct ``@pytest.mark.xdist_group`` on the same tests
+    landed them all on gw0. Applying the marker late is the same as not
+    applying it.
+    """
+    for item in items:
+        if item.get_closest_marker("no_keychain_fake"):
+            item.add_marker(pytest.mark.xdist_group("real-keychain"))
