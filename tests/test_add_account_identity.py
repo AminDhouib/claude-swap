@@ -23,7 +23,6 @@ import pytest
 
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.exceptions import ConfigError, ValidationError
-import os
 
 CREDS = json.dumps({"claudeAiOauth": {
     "accessToken": "sk-ant-oat01-THEIRS", "refreshToken": "rt-theirs",
@@ -719,21 +718,3 @@ def test_the_guard_receives_the_triple_THAT_WAS_READ_not_a_rebuild(
         "_get_current_identity_triple returned, or a sibling change that "
         "overwrites one of the unpacked names silently poisons it"
     )
-
-
-class TestTheStashNamesWhoCouldHaveWrittenIt:
-    """#117's writer is unidentified, and the stash is where that gets fixed.
-
-    The evidence already saved answers WHAT was written (both identities) and
-    WHEN (the credential's mtime). It does not answer WHO, and by the time
-    anyone reads the warning the candidates have exited. Measured 2026-08-25:
-    two foreign credentials landed 31 minutes apart, each belonging to a
-    DIFFERENT third account while the config kept naming the first — so it is
-    not a refresh (same account) and not a race (same account), it is somebody
-    logging in past cswap. Nothing recorded what was running at either moment,
-    so both are closed as unknown.
-
-    This is instrumentation, not a repair: it cannot stop the write, it makes
-    the NEXT one nameable.
-    """
-
