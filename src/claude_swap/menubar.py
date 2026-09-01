@@ -662,15 +662,19 @@ def run(switcher) -> int:
             # NSMenu tree (itemArray, recursing into submenus) rather than the
             # rumps Python dict: that dict is keyed by title and silently drops
             # same-title items, which would leave leaked entries behind.
-            _reg = rumps.rumps.NSApp._ns_to_py_and_callback
-            def _purge(nsmenu):
-                for _it in nsmenu.itemArray():
-                    _reg.pop(_it, None)
-                    _sub = _it.submenu()
-                    if _sub is not None:
-                        _purge(_sub)
-            _purge(self.menu._menu)
+            # Guard the private rumps attribute: if a future rumps release renames
+            # it, degrade to "leaks again" rather than crashing on every rebuild.
+            _reg = getattr(rumps.rumps.NSApp, "_ns_to_py_and_callback", None)
+            if _reg is not None:
+                def _purge(nsmenu):
+                    for _it in nsmenu.itemArray():
+                        _reg.pop(_it, None)
+                        _sub = _it.submenu()
+                        if _sub is not None:
+                            _purge(_sub)
+                _purge(self.menu._menu)
             self.menu.clear()
+            account_items = []
             for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
                     format_account_label(
