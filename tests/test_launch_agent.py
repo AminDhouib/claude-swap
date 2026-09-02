@@ -9,6 +9,7 @@ or writes outside the temp directory.
 
 from __future__ import annotations
 
+import os
 import plistlib
 import subprocess
 import sys
@@ -54,7 +55,17 @@ def test_build_plist_is_parseable_and_runs_the_menubar_subcommand(tmp_path):
     assert parsed["Label"] == launch_agent.LABEL
     assert parsed["ProgramArguments"] == [*PROGRAM, "menubar"]
     assert parsed["RunAtLoad"] is True
-    assert parsed["KeepAlive"] is True
+
+
+def test_build_plist_keepalive_restarts_a_crash_but_respects_a_quit(tmp_path):
+    """A bare `KeepAlive: True` would make the menu bar's Quit item a no-op.
+
+    menubar.py's quit handler calls rumps.quit_application() — a clean exit(0)
+    — so unconditional KeepAlive relaunches it immediately and the user has no
+    way to stop the menu bar short of `launchctl bootout`.
+    """
+    parsed = plistlib.loads(launch_agent.build_plist(PROGRAM, home=tmp_path))
+    assert parsed["KeepAlive"] == {"SuccessfulExit": False}
 
 
 def test_build_plist_marks_the_agent_interactive_not_background(tmp_path):
@@ -74,6 +85,14 @@ def test_build_plist_path_env_leads_with_the_programs_own_directory(tmp_path):
     assert parsed["EnvironmentVariables"]["PATH"].split(":")[0] == "/Users/x/.local/bin"
 
 
+def test_build_plist_path_env_includes_the_user_bin_dir(tmp_path):
+    # A uv tool install puts cswap's siblings in ~/.local/bin; launchd's own
+    # default PATH does not include it.
+    parsed = plistlib.loads(launch_agent.build_plist(PROGRAM, home=tmp_path))
+    entries = parsed["EnvironmentVariables"]["PATH"].split(":")
+    assert os.path.expanduser("~/.local/bin") in entries
+
+
 def test_build_plist_path_env_keeps_the_launchd_defaults(tmp_path):
     parsed = plistlib.loads(launch_agent.build_plist(PROGRAM, home=tmp_path))
     entries = parsed["EnvironmentVariables"]["PATH"].split(":")
@@ -87,7 +106,36 @@ def test_resolve_program_prefers_the_console_script(tmp_path):
     script = tmp_path / "cswap"
     script.write_text("#!/bin/sh\n")
     with patch.object(launch_agent.sys, "argv", [str(script)]):
-        assert launch_agent.resolve_program() == [str(script.resolve())]
+        assert launch_agent.resolve_program() == [str(script)]
+
+
+def test_resolve_program_keeps_the_symlink_and_does_not_follow_it(tmp_path):
+    """`uv tool install` links ~/.local/bin/cswap into the tool's virtualenv.
+
+    Resolving that symlink would pin the virtualenv-internal path, which a
+    reinstall recreates — exactly the path this module exists to avoid.
+    """
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    real = venv_bin / "cswap"
+    real.write_text("#!/bin/sh\n")
+    link_dir = tmp_path / "local" / "bin"
+    link_dir.mkdir(parents=True)
+    link = link_dir / "cswap"
+    link.symlink_to(real)
+
+    with patch.object(launch_agent.sys, "argv", [str(link)]):
+        assert launch_agent.resolve_program() == [str(link)]
+
+
+def test_resolve_program_makes_a_relative_argv0_absolute(tmp_path, monkeypatch):
+    script = tmp_path / "cswap"
+    script.write_text("#!/bin/sh\n")
+    monkeypatch.chdir(tmp_path)
+    with patch.object(launch_agent.sys, "argv", ["./cswap"]):
+        result = launch_agent.resolve_program()
+    assert result == [str(script)]
+    assert Path(result[0]).is_absolute()
 
 
 def test_resolve_program_falls_back_to_the_interpreter_without_a_script(tmp_path):
@@ -105,7 +153,7 @@ def test_resolve_program_ignores_an_argv0_that_is_not_cswap(tmp_path):
     found.write_text("#!/bin/sh\n")
     with patch.object(launch_agent.sys, "argv", [str(other)]):
         with patch.object(launch_agent.shutil, "which", return_value=str(found)):
-            assert launch_agent.resolve_program() == [str(found.resolve())]
+            assert launch_agent.resolve_program() == [str(found)]
 
 
 # --- install ---------------------------------------------------------------

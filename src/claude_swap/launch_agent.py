@@ -40,7 +40,7 @@ LABEL = "com.cswap.menubar"
 # launchd's default PATH is /usr/bin:/bin:/usr/sbin:/sbin, which covers
 # `security` (Keychain reads) but not a Homebrew or ~/.local/bin `claude`. The
 # menu bar shells out to detect running sessions, so seed a PATH that finds it.
-_EXTRA_PATH_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+_EXTRA_PATH_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
 _BASE_PATH_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 
 
@@ -78,19 +78,22 @@ def resolve_program() -> list[str]:
     Prefers the installed console script (stable across upgrades, see the
     module docstring) and falls back to running the package through the
     interpreter that is executing right now.
+
+    The path is made absolute but deliberately NOT resolved: a `uv tool
+    install` puts a symlink at ``~/.local/bin/cswap`` pointing into the tool's
+    virtualenv, and resolving it would write that virtualenv-internal path
+    into the plist — the very path this module avoids pinning, since a
+    reinstall recreates the virtualenv while the symlink keeps its name.
     """
-    candidate = Path(sys.argv[0]) if sys.argv and sys.argv[0] else None
+    candidate = sys.argv[0] if sys.argv and sys.argv[0] else None
     if candidate is not None:
-        try:
-            resolved = candidate.resolve()
-        except OSError:
-            resolved = None
-        if resolved is not None and resolved.is_file() and resolved.name == "cswap":
-            return [str(resolved)]
+        absolute = Path(os.path.abspath(candidate))
+        if absolute.name == "cswap" and absolute.is_file():
+            return [str(absolute)]
 
     which = shutil.which("cswap")
     if which:
-        return [str(Path(which).resolve())]
+        return [str(Path(os.path.abspath(which)))]
 
     return [sys.executable, "-m", "claude_swap"]
 
@@ -102,8 +105,9 @@ def _path_env(program: list[str]) -> str:
     if str(first) not in ("", "."):
         dirs.append(str(first))
     for extra in (*_EXTRA_PATH_DIRS, *_BASE_PATH_DIRS):
-        if extra not in dirs:
-            dirs.append(extra)
+        expanded = os.path.expanduser(extra)
+        if expanded not in dirs:
+            dirs.append(expanded)
     return ":".join(dirs)
 
 
@@ -124,7 +128,11 @@ def build_plist(
             "Label": label,
             "ProgramArguments": [*program, "menubar"],
             "RunAtLoad": True,
-            "KeepAlive": True,
+            # Restart a crash, but respect a deliberate Quit. The menu bar's
+            # quit handler calls rumps.quit_application(), a clean exit(0);
+            # under a bare `KeepAlive: True` launchd would relaunch it at once
+            # and the Quit item would do nothing the user can see.
+            "KeepAlive": {"SuccessfulExit": False},
             # A menu bar owner is a UI process; Background would have launchd
             # apply throttled I/O and CPU bands to it.
             "ProcessType": "Interactive",
