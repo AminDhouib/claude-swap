@@ -80,11 +80,19 @@ def test_build_plist_survives_paths_that_would_break_hand_written_xml(tmp_path):
     assert parsed["StandardErrorPath"] == str(odd / "Library/Logs" / f"{launch_agent.LABEL}.err")
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="asserts POSIX path shapes; the agent only ever runs on macOS",
+)
 def test_build_plist_path_env_leads_with_the_programs_own_directory(tmp_path):
     parsed = plistlib.loads(launch_agent.build_plist(PROGRAM, home=tmp_path))
     assert parsed["EnvironmentVariables"]["PATH"].split(":")[0] == "/Users/x/.local/bin"
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="asserts POSIX path shapes; the agent only ever runs on macOS",
+)
 def test_build_plist_path_env_includes_the_user_bin_dir(tmp_path):
     # A uv tool install puts cswap's siblings in ~/.local/bin; launchd's own
     # default PATH does not include it.
