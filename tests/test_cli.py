@@ -572,6 +572,17 @@ class TestCLI:
 
         assert exc.value.code == 1
 
+    def test_service_flags_are_rejected_outside_menubar(self, monkeypatch, capsys):
+        # `--full` already guards this way; without a matching check
+        # `cswap list --install-service` would be accepted and silently ignored.
+        monkeypatch.setattr(sys, "argv", ["cswap", "list", "--install-service"])
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+
+        assert exc.value.code == 2
+        assert "can only be used with 'menubar'" in capsys.readouterr().err
+
     def test_plain_menubar_does_not_touch_the_service(self, monkeypatch):
         seen = self._service_harness(monkeypatch, ["cswap", "menubar"])
 

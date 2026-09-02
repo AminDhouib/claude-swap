@@ -1322,6 +1322,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.full and not args.export:
         parser.error("--full can only be used with 'export'")
 
+    if (
+        args.install_service or args.uninstall_service or args.service_status
+    ) and not args.menubar:
+        parser.error(
+            "--install-service, --uninstall-service and --service-status "
+            "can only be used with 'menubar'"
+        )
+
     # Self-upgrade runs before switcher init so we don't touch config/keychain
     # just to upgrade the tool itself.
     if args.upgrade:

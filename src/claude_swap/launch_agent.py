@@ -31,6 +31,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError
@@ -42,6 +43,13 @@ LABEL = "com.cswap.menubar"
 # menu bar shells out to detect running sessions, so seed a PATH that finds it.
 _EXTRA_PATH_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
 _BASE_PATH_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+
+# `launchctl bootout` can return before launchd has finished tearing the
+# job down, and a `bootstrap` inside that window fails with "Operation
+# already in progress". Poll until the job is really gone instead of
+# assuming bootout was synchronous (Homebrew's services code does the same).
+_UNLOAD_TIMEOUT_SECONDS = 5.0
+_UNLOAD_POLL_SECONDS = 0.1
 
 
 def _require_macos() -> None:
@@ -155,6 +163,20 @@ def _launchctl(*args: str) -> subprocess.CompletedProcess:
         raise ClaudeSwitchError("launchctl not found; is this macOS?") from e
 
 
+def _wait_until_unloaded(
+    label: str = LABEL,
+    uid: int | None = None,
+    timeout: float = _UNLOAD_TIMEOUT_SECONDS,
+) -> bool:
+    """Block until launchd has dropped the job. True if it went away in time."""
+    deadline = time.monotonic() + timeout
+    while is_loaded(label, uid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_UNLOAD_POLL_SECONDS)
+    return True
+
+
 def is_loaded(label: str = LABEL, uid: int | None = None) -> bool:
     """Whether launchd currently knows about the service."""
     return _launchctl("print", service_target(label, uid)).returncode == 0
@@ -213,12 +235,16 @@ def install(
     out_log.parent.mkdir(parents=True, exist_ok=True)
     target_plist.write_bytes(build_plist(program, label, home))
 
+    settled = True
     if is_loaded(label, uid):
         _launchctl("bootout", service_target(label, uid))
+        settled = _wait_until_unloaded(label, uid)
 
     booted = _launchctl("bootstrap", domain_target(uid), str(target_plist))
     if booted.returncode != 0:
         detail = (booted.stderr or booted.stdout or "").strip()
+        if not settled:
+            detail = f"{detail}; the previous instance was still shutting down".lstrip("; ")
         raise ClaudeSwitchError(
             f"launchctl bootstrap failed (exit {booted.returncode})"
             + (f": {detail}" if detail else "")

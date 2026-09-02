@@ -203,6 +203,48 @@ def test_install_does_not_boot_out_when_nothing_is_loaded(tmp_path):
     assert "bootout" not in [c.args[0][1] for c in run.call_args_list]
 
 
+def test_install_waits_for_the_old_job_to_go_away_before_bootstrapping(tmp_path):
+    """`bootout` can return before launchd has finished the teardown.
+
+    A `bootstrap` inside that window fails with "Operation already in
+    progress", so install polls until the job is actually gone.
+    """
+    prints = {"n": 0}
+
+    def run(argv, **kwargs):
+        if argv[1] == "print":
+            prints["n"] += 1
+            return _completed(0 if prints["n"] <= 3 else 1)
+        return _completed(0)
+
+    with patch.object(launch_agent.time, "sleep") as slept:
+        with patch.object(launch_agent.subprocess, "run", side_effect=run) as ran:
+            launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
+
+    assert slept.called, "did not wait for the old job at all"
+    subcommands = [c.args[0][1] for c in ran.call_args_list]
+    # every liveness check sits between the bootout and the bootstrap
+    assert subcommands.index("bootout") < subcommands.index("bootstrap")
+    assert subcommands.count("print") > 2
+
+
+def test_wait_until_unloaded_gives_up_after_the_timeout(tmp_path):
+    with patch.object(launch_agent.time, "sleep"):
+        with patch.object(launch_agent.subprocess, "run") as run:
+            run.side_effect = _router({"print": _completed(0)})
+            assert launch_agent._wait_until_unloaded(uid=UID, timeout=0.0) is False
+
+
+def test_install_names_the_lingering_predecessor_when_bootstrap_fails(tmp_path):
+    with patch.object(launch_agent, "_wait_until_unloaded", return_value=False):
+        with patch.object(launch_agent.subprocess, "run") as run:
+            run.side_effect = _router(
+                {"print": _completed(0), "bootstrap": _completed(5, stderr="Operation already in progress")}
+            )
+            with pytest.raises(ClaudeSwitchError, match="still shutting down"):
+                launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
+
+
 def test_install_raises_with_launchctl_detail_when_bootstrap_fails(tmp_path):
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router(
